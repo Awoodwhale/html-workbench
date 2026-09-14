@@ -278,3 +278,53 @@ test('an owned process that exits is reaped without a subprocess call', quiet(as
   assert.equal(after.owned, false, 'a dead handle must be released')
   assert.ok(after.journal.some((entry) => entry.message.includes('意外退出')))
 }))
+
+test('the panel reports the directories the service really uses', async () => {
+  // The service re-probes in-process and falls back, because the runtime paths it
+  // is handed may be exactly what the sandbox refuses (DSH grants only the
+  // workspace and a private temp folder). Echoing the REQUESTED paths afterwards
+  // is what made a perfectly healthy service look broken to its own user.
+  const shell = {
+    resolve: (spec) => spec,
+    run: async () => ({
+      exitCode: 0,
+      stdout: collected(JSON.stringify({
+        ok: true,
+        service: 'html-workbench',
+        version: '2.1.0',
+        logDir: 'C:\\ws\\.html-workbench\\logs',
+        vendorCache: 'C:\\ws\\.html-workbench\\vendor',
+      })),
+      stderr: collected(''),
+    }),
+    start: () => ({ status: 'running', exitCode: null, signal: null, readOutput: () => ({ delta: '' }), kill: () => true }),
+  }
+  const ctx = await boot(shell, { port: 4913, runtimeDir: 'C:/Temp/.html-workbench' })
+  const diag = await callRoute(ctx, '/html-workbench/diagnostics')
+
+  assert.equal(diag.logDir, 'C:\\ws\\.html-workbench\\logs')
+  assert.equal(diag.vendorCache, 'C:\\ws\\.html-workbench\\vendor')
+})
+
+test('a service that advertises no directories keeps the requested ones', async () => {
+  // Backwards compatibility: an already-running 0.3.0-era service cannot report
+  // them, and the panel must still say something rather than nothing.
+  const ctx = await boot(healthyShell('2.1.0'), { port: 4914, runtimeDir: 'C:/Temp/.html-workbench' })
+  const diag = await callRoute(ctx, '/html-workbench/diagnostics')
+
+  assert.equal(diag.logDir, 'C:/Temp/.html-workbench/logs')
+  assert.equal(diag.vendorCache, 'C:/Temp/.html-workbench/vendor')
+})
+
+test('host and service agree on one runtime folder name', () => {
+  // Two different names would scatter two directories through the user's
+  // workspace: the host's first guess and the service's own fallback must match.
+  const service = readFileSync(resolve(HERE, '..', 'service', 'server', 'workbench.py'), 'utf8')
+  const declared = /^RUNTIME_DIR_NAME = "([^"]+)"/m.exec(service)
+  assert.ok(declared, 'workbench.py must declare RUNTIME_DIR_NAME')
+
+  for (const name of ['dsh-plugin/src/host.js', 'dsh-plugin/src/index.js']) {
+    const source = readFileSync(resolve(HERE, '..', name), 'utf8')
+    assert.ok(source.includes(declared[1]), `${name} must reference ${declared[1]}`)
+  }
+})

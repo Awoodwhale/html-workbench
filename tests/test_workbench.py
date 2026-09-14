@@ -203,7 +203,10 @@ class HttpTests(unittest.TestCase):
             path = self.root / name
             path.write_bytes(f"test-{name}".encode())
             self.vendor[name] = path
-        self.server = workbench.WorkbenchServer(("127.0.0.1", 0), self.asset, self.root, self.vendor)
+        self.server = workbench.WorkbenchServer(
+            ("127.0.0.1", 0), self.asset, self.root, self.vendor,
+            log_dir=self.root / "logs", vendor_cache=self.root / "vendor",
+        )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
@@ -222,6 +225,11 @@ class HttpTests(unittest.TestCase):
         status, health = self.read_json("/api/health")
         self.assertEqual(status, 200)
         self.assertEqual(health["service"], workbench.SERVICE_NAME)
+        # The host reports these in its diagnostics. A REUSED service leaves it no
+        # startup output, so /api/health is the only way it can learn — and show —
+        # the directories really in use.
+        self.assertEqual(health["logDir"], str(self.root / "logs"))
+        self.assertEqual(health["vendorCache"], str(self.root / "vendor"))
         query = urllib.parse.urlencode({"file": str(self.page)})
         status, document = self.read_json(f"/api/document?{query}")
         self.assertEqual(status, 200)
@@ -470,11 +478,96 @@ class FileReferenceTests(unittest.TestCase):
     def test_setup_logging_writes_rotating_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             port = 4399
-            logger = workbench.setup_logging(tmp, port)
+            logger, directory = workbench.setup_logging(tmp, port)
             logger.info("hello %s", "world")
-            log_file = Path(tmp) / f"workbench-{port}.log"
-            self.assertTrue(log_file.is_file())
+            # The resolved directory comes back so the host can report where the
+            # log really is; asserting the file is INSIDE it states that contract
+            # without assuming the requested directory was the one that won.
+            log_file = directory / f"workbench-{port}.log"
+            self.assertTrue(log_file.is_file(), f"log written to {directory}")
             self.assertIn("hello world", log_file.read_text(encoding="utf-8"))
+
+
+class WritableDirectoryTests(unittest.TestCase):
+    """Runtime directories must be probed, and a refused probe must fail fast.
+
+    DSH runs the service as a sandboxed child whose restricted token may write
+    only the session workspace and a private temp directory: a folder whose DACL
+    looks writable to `os.access` (the ambient %TEMP% root on Windows) rejects
+    every create with EACCES / WinError 5. `tempfile.mkstemp` misreads that as a
+    taken name and retries 10 000 times, which turned a one-second error into a
+    service that never became healthy while pinning a CPU core — so these tests
+    pin down both the fallback and the fact that nothing retries.
+
+    They stub the file-system calls rather than creating files: a test asserting
+    "this directory refuses writes" must not itself need a writable directory.
+    """
+
+    def test_make_temp_file_raises_immediately_instead_of_retrying(self):
+        attempted = []
+
+        def deny(path, flags, mode=0o777):
+            attempted.append(path)
+            raise PermissionError(13, "Permission denied", str(path))
+
+        with mock.patch.object(workbench.os, "open", deny):
+            with self.assertRaises(PermissionError):
+                workbench.make_temp_file(Path("denied-dir"), prefix=".probe.")
+        # Exactly one attempt: a retry loop here is the bug being prevented.
+        self.assertEqual(len(attempted), 1)
+
+    def test_make_temp_file_retries_only_when_the_name_is_taken(self):
+        attempted = []
+
+        def collide_once(path, flags, mode=0o777):
+            attempted.append(path)
+            if len(attempted) == 1:
+                raise FileExistsError(17, "File exists", str(path))
+            return 7
+
+        with mock.patch.object(workbench.os, "open", collide_once), \
+             mock.patch.object(workbench.os, "close"):
+            descriptor, path = workbench.make_temp_file(Path("probe-dir"), prefix=".probe.")
+
+        # The caller owns the descriptor (pick_writable_dir closes it), so the
+        # function must hand back the one it opened.
+        self.assertEqual(descriptor, 7)
+        self.assertEqual(len(attempted), 2)
+        self.assertEqual(Path(path).parent, Path("probe-dir"))
+        self.assertTrue(Path(path).name.startswith(".probe."))
+
+    def test_pick_writable_dir_skips_a_folder_that_denies_writes(self):
+        denied = Path("denied-dir")
+        allowed = Path("allowed-dir")
+
+        def probe(directory, prefix, suffix=""):
+            if Path(directory) == denied:
+                raise PermissionError(13, "Permission denied", str(directory))
+            return 8, Path(directory) / ".wb-write-probe.fake"
+
+        with mock.patch.object(workbench, "make_temp_file", probe), \
+             mock.patch.object(workbench.Path, "mkdir"), \
+             mock.patch.object(workbench.os, "close"):
+            self.assertEqual(workbench.pick_writable_dir(denied, allowed), allowed)
+
+    def test_pick_writable_dir_falls_back_to_the_first_candidate(self):
+        denied = Path("denied-dir")
+        with mock.patch.object(workbench, "make_temp_file", side_effect=PermissionError(13, "denied")), \
+             mock.patch.object(workbench.Path, "mkdir"):
+            # Nothing is writable: return a deterministic path so the real write
+            # raises something the caller can explain.
+            self.assertEqual(workbench.pick_writable_dir(denied), denied)
+
+    def test_log_candidates_try_the_request_then_the_workspace(self):
+        candidates = workbench.log_candidates("/requested/logs")
+        self.assertEqual(candidates[0], Path("/requested/logs"))
+        self.assertEqual(candidates[1], workbench.runtime_directory() / "logs")
+
+    def test_vendor_cache_follows_the_log_directory_that_won(self):
+        candidates = workbench.vendor_candidates("/requested/vendor", Path("/granted") / workbench.RUNTIME_DIR_NAME / "logs")
+        self.assertEqual(candidates[0], Path("/requested/vendor"))
+        # Beside the directory that accepted the log, whose parent is proven writable.
+        self.assertEqual(candidates[1], Path("/granted") / workbench.RUNTIME_DIR_NAME / "vendor")
 
 
 if __name__ == "__main__":

@@ -34,7 +34,7 @@ from typing import Any
 
 
 SERVICE_NAME = "html-workbench"
-SERVICE_VERSION = "2.1.0"
+SERVICE_VERSION = "2.2.0"
 
 DEFAULT_PORT = 4317
 # Capability names advertised by /api/health. `command_open` refuses to reuse a
@@ -126,6 +126,109 @@ def default_log_dir() -> Path:
     return base / "html-workbench" / "logs"
 
 
+# Name of the runtime-state folder this process keeps beside its working
+# directory. The DSH plugin resolves the same name host-side, so both halves
+# agree on one location instead of scattering `.html-workbench` and
+# `html-workbench-dsh` through the user's workspace.
+RUNTIME_DIR_NAME = ".html-workbench"
+
+
+def runtime_directory() -> Path:
+    """Return this process's runtime-state root: `<cwd>/<RUNTIME_DIR_NAME>`.
+
+    Under DSH the working directory is the session workspace, which is one of the
+    only two trees the subprocess sandbox grants write access to — the other is a
+    private temp directory it hands the child through TEMP/TMP. Everywhere else
+    the working directory is simply a sensible, self-cleaning location. Logs and
+    the GrapesJS cache are disposable, so either is acceptable; what is NOT
+    acceptable is a path the sandbox refuses (see `pick_writable_dir`).
+    """
+    return Path.cwd() / RUNTIME_DIR_NAME
+
+
+def make_temp_file(directory: Path, prefix: str, suffix: str = "") -> tuple[int, Path]:
+    """Create a uniquely named temporary file in `directory`; return (fd, path).
+
+    Deliberately NOT `tempfile.mkstemp`. On Windows CPython's `_mkstemp_inner`
+    treats a `PermissionError` as "that name is already taken": it re-checks the
+    directory with `os.access(dir, os.W_OK)` and then retries with a NEW random
+    name, up to TMP_MAX (10 000) times. A real DACL always looks writable to
+    `os.access`, which cannot see the restricted token DSH's sandbox runs the
+    child under — so a directory the sandbox refuses makes `mkstemp` spin for
+    minutes (one denied `os.open` per iteration, ~4 ms each) instead of failing
+    in milliseconds. A single O_EXCL open turns that into an immediate error the
+    caller can catch and recover from.
+    """
+    for attempt in range(64):
+        candidate = Path(directory) / f"{prefix}{os.getpid()}-{attempt}-{os.urandom(6).hex()}{suffix}"
+        try:
+            descriptor = os.open(
+                candidate,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0),
+                0o600,
+            )
+        except FileExistsError:
+            continue
+        return descriptor, candidate
+    raise FileExistsError(f"无法在 {directory} 创建临时文件：连续的文件名冲突")
+
+
+def pick_writable_dir(*candidates: Path) -> Path:
+    """Return the first candidate directory this process can really write into.
+
+    Existence proves nothing: the sandbox DACL looks writable on paper while the
+    restricted token is denied, and a folder the unconfined parent created may
+    reject every file creation here with EACCES / WinError 5. The only reliable
+    test is an actual create, which `make_temp_file` performs and fails fast.
+    Falls back to the first candidate so a caller with nothing writable at all
+    still gets a deterministic path (and a clear error at the real write).
+    """
+    fallback: Path | None = None
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        if fallback is None:
+            fallback = candidate
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        try:
+            descriptor, probe = make_temp_file(candidate, prefix=".wb-write-probe.")
+        except OSError:
+            continue
+        os.close(descriptor)
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+        return candidate
+    return fallback if fallback is not None else Path.cwd()
+
+
+def log_candidates(log_dir: Path | str) -> tuple[Path, ...]:
+    """Log directories to try, best first: the caller's, then writable fallbacks."""
+    return (
+        Path(log_dir).expanduser(),
+        runtime_directory() / "logs",
+        Path(tempfile.gettempdir()) / RUNTIME_DIR_NAME / "logs",
+    )
+
+
+def vendor_candidates(vendor_cache: Path | str, log_dir: Path) -> tuple[Path, ...]:
+    """Vendor-cache directories to try, best first.
+
+    The cache sits beside whichever directory accepted the log: both are
+    re-creatable, and the log's parent already proved it is writable.
+    """
+    return (
+        Path(vendor_cache).expanduser(),
+        Path(log_dir).parent / "vendor",
+        runtime_directory() / "vendor",
+        Path(tempfile.gettempdir()) / RUNTIME_DIR_NAME / "vendor",
+    )
+
+
 _logger: logging.Logger | None = None
 
 
@@ -144,11 +247,18 @@ def get_logger() -> logging.Logger:
     return _logger
 
 
-def setup_logging(log_dir: Path | str, port: int | None = None) -> logging.Logger:
-    """Attach the rotating file handler and return the module logger."""
+def setup_logging(log_dir: Path | str, port: int | None = None) -> tuple[logging.Logger, Path]:
+    """Attach the rotating file handler; return the logger and the directory used.
+
+    The requested `--log-dir` can be unusable even when it already exists — the
+    sandbox denies writes to a folder whose DACL looks writable (see
+    `pick_writable_dir`). The directory is therefore probed and handed back to
+    the caller, so the host can report where the log really is instead of echoing
+    the path it merely asked for. A missing service log is never worth failing
+    the whole start.
+    """
     global _logger
-    directory = Path(log_dir).expanduser()
-    directory.mkdir(parents=True, exist_ok=True)
+    directory = pick_writable_dir(*log_candidates(log_dir))
     filename = f"workbench-{port}.log" if port is not None else "workbench.log"
     handler = RotatingFileHandler(
         directory / filename,
@@ -164,7 +274,7 @@ def setup_logging(log_dir: Path | str, port: int | None = None) -> logging.Logge
             logger.removeHandler(existing)
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
-    return logger
+    return logger, directory
 
 
 def sha256_bytes(content: bytes) -> str:
@@ -218,7 +328,7 @@ def vendor_from_cdn(base_url: str) -> dict[str, bytes]:
 def write_vendor_cache(cache_dir: Path, files: dict[str, bytes]) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     for name, content in files.items():
-        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{name}.", dir=cache_dir)
+        descriptor, temporary_name = make_temp_file(cache_dir, prefix=f".{name}.")
         try:
             with os.fdopen(descriptor, "wb") as output:
                 output.write(content)
@@ -982,9 +1092,9 @@ def promote_identities(target: Path, descriptors: list[dict[str, Any]], base_rev
 
 
 def write_atomic(target: Path, content: str) -> None:
-    temporary_name: str | None = None
+    temporary_name: Path | None = None
     try:
-        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.workbench-", suffix=".tmp", dir=target.parent)
+        descriptor, temporary_name = make_temp_file(target.parent, prefix=f".{target.name}.workbench-", suffix=".tmp")
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
             output.write(content)
             output.flush()
@@ -1231,7 +1341,7 @@ def save_document(target: Path, body: dict[str, Any]) -> dict[str, Any]:
     if latest["revision"] != base_revision:
         raise WorkbenchError("REVISION_CONFLICT", "保存期间文件发生外部修改，未覆盖最新版。", 409, document=latest)
 
-    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.workbench-", suffix=".tmp", dir=target.parent)
+    descriptor, temporary_name = make_temp_file(target.parent, prefix=f".{target.name}.workbench-", suffix=".tmp")
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as output:
             output.write(source)
@@ -1249,11 +1359,24 @@ class WorkbenchServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address: tuple[str, int], asset_file: Path, editor_root: Path, vendor_files: dict[str, Path]) -> None:
+    def __init__(
+        self,
+        address: tuple[str, int],
+        asset_file: Path,
+        editor_root: Path,
+        vendor_files: dict[str, Path],
+        log_dir: Path | None = None,
+        vendor_cache: Path | None = None,
+    ) -> None:
         self.asset_file = asset_file.resolve(strict=True)
         self.editor_root = editor_root.resolve(strict=True)
         self.vendor_files = {name: path.resolve(strict=True) for name, path in vendor_files.items()}
         self.vendor_routes = {str(metadata["route"]): name for name, metadata in VENDOR_ASSETS.items()}
+        # Advertised by /api/health so the host can report the directories actually
+        # in use — including when it REUSES a service it did not start and has no
+        # startup output to read them from.
+        self.log_dir = Path(log_dir) if log_dir is not None else None
+        self.vendor_cache = Path(vendor_cache) if vendor_cache is not None else None
         super().__init__(address, WorkbenchHandler)
 
 
@@ -1300,14 +1423,23 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         try:
             if parsed.path == "/api/health":
-                self.send_json(200, {
+                payload: dict[str, Any] = {
                     "ok": True,
                     "service": SERVICE_NAME,
                     "version": SERVICE_VERSION,
                     "port": self.server.server_port,
                     "editorRoot": str(self.server.editor_root),
                     "capabilities": list(SERVICE_CAPABILITIES),
-                })
+                }
+                # Report where this process really writes. The host shows these in
+                # its diagnostics, so a REUSED service describes its own
+                # directories instead of the ones the caller asked for — which may
+                # be exactly what the sandbox refused.
+                if self.server.log_dir is not None:
+                    payload["logDir"] = str(self.server.log_dir)
+                if self.server.vendor_cache is not None:
+                    payload["vendorCache"] = str(self.server.vendor_cache)
+                self.send_json(200, payload)
                 return
             if parsed.path == "/api/document":
                 self.send_json(200, read_document(self.query_file(query)))
@@ -1537,8 +1669,7 @@ def terminate_process(pid: int) -> None:
 
 
 def start_detached(script_file: Path, port: int, editor_root: Path, asset_file: Path | None, vendor_cache: Path, log_dir: Path) -> tuple[int, Path]:
-    directory = Path(log_dir).expanduser()
-    directory.mkdir(parents=True, exist_ok=True)
+    directory = pick_writable_dir(*log_candidates(log_dir))
     log_file = directory / f"html-workbench-{port}.log"
     command = [sys.executable, str(script_file), "serve", "--port", str(port), "--editor-root", str(editor_root), "--vendor-cache", str(vendor_cache), "--log-dir", str(directory)]
     if asset_file is not None:
@@ -1555,13 +1686,25 @@ def start_detached(script_file: Path, port: int, editor_root: Path, asset_file: 
 
 
 def command_serve(args: argparse.Namespace, script_file: Path) -> int:
-    logger = setup_logging(args.log_dir, args.port)
+    logger, log_directory = setup_logging(args.log_dir, args.port)
     asset_file = Path(args.asset).expanduser().resolve(strict=True) if args.asset else default_asset_file(script_file)
     editor_root = Path(args.editor_root).expanduser().resolve(strict=True)
-    vendor_files = ensure_vendor_assets(Path(args.vendor_cache).expanduser())
-    server = WorkbenchServer(("127.0.0.1", args.port), asset_file, editor_root, vendor_files)
-    logger.info("service started: port=%s editorRoot=%s logDir=%s", args.port, editor_root, Path(args.log_dir).expanduser())
-    print(json.dumps({"ok": True, "url": f"http://127.0.0.1:{args.port}", "editorRoot": str(editor_root)}, ensure_ascii=False), flush=True)
+    # Logs and cache are both disposable, so they follow the writable location the
+    # sandbox really granted instead of the path the parent requested.
+    vendor_cache = pick_writable_dir(*vendor_candidates(args.vendor_cache, log_directory))
+    vendor_files = ensure_vendor_assets(vendor_cache)
+    server = WorkbenchServer(("127.0.0.1", args.port), asset_file, editor_root, vendor_files, log_directory, vendor_cache)
+    logger.info("service started: port=%s editorRoot=%s logDir=%s vendorCache=%s", args.port, editor_root, log_directory, vendor_cache)
+    # The host surfaces these two paths in its diagnostics, so the panel shows the
+    # directories actually in use rather than echoing the ones it asked for — the
+    # requested ones may be exactly what the sandbox refused.
+    print(json.dumps({
+        "ok": True,
+        "url": f"http://127.0.0.1:{args.port}",
+        "editorRoot": str(editor_root),
+        "logDir": str(log_directory),
+        "vendorCache": str(vendor_cache),
+    }, ensure_ascii=False), flush=True)
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

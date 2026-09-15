@@ -255,25 +255,31 @@ def setup_logging(log_dir: Path | str, port: int | None = None) -> tuple[logging
     `pick_writable_dir`). The directory is therefore probed and handed back to
     the caller, so the host can report where the log really is instead of echoing
     the path it merely asked for. A missing service log is never worth failing
-    the whole start.
+    the whole start: when EVERY candidate refuses writes, `pick_writable_dir`
+    returns a deterministic path that the handler cannot open, so the failure is
+    swallowed and the service runs without a file log rather than never binding
+    its port.
     """
     global _logger
     directory = pick_writable_dir(*log_candidates(log_dir))
     filename = f"workbench-{port}.log" if port is not None else "workbench.log"
-    handler = RotatingFileHandler(
-        directory / filename,
-        maxBytes=LOG_MAX_BYTES,
-        backupCount=LOG_BACKUP_COUNT,
-        encoding="utf-8",
-    )
-    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     logger = get_logger()
     for existing in list(logger.handlers):
         if isinstance(existing, RotatingFileHandler):
             existing.close()
             logger.removeHandler(existing)
-    logger.addHandler(handler)
     logger.setLevel(logging.INFO)
+    try:
+        handler = RotatingFileHandler(
+            directory / filename,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+    except OSError:
+        return logger, directory
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(handler)
     return logger, directory
 
 
@@ -1668,9 +1674,15 @@ def terminate_process(pid: int) -> None:
         pass
 
 
-def start_detached(script_file: Path, port: int, editor_root: Path, asset_file: Path | None, vendor_cache: Path, log_dir: Path) -> tuple[int, Path]:
+def start_detached(script_file: Path, port: int, editor_root: Path, asset_file: Path | None, vendor_cache: Path, log_dir: Path) -> tuple[int, Path | None]:
+    """Spawn a detached `serve` and return (pid, path of its captured output).
+
+    The path is None when no candidate directory accepted the file: a service
+    whose console output cannot be captured must still start, so the output is
+    discarded rather than the spawn abandoned (see `setup_logging`).
+    """
     directory = pick_writable_dir(*log_candidates(log_dir))
-    log_file = directory / f"html-workbench-{port}.log"
+    log_file: Path | None = directory / f"html-workbench-{port}.log"
     command = [sys.executable, str(script_file), "serve", "--port", str(port), "--editor-root", str(editor_root), "--vendor-cache", str(vendor_cache), "--log-dir", str(directory)]
     if asset_file is not None:
         command.extend(["--asset", str(asset_file)])
@@ -1680,8 +1692,22 @@ def start_detached(script_file: Path, port: int, editor_root: Path, asset_file: 
         flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS  # type: ignore[attr-defined]
         kwargs["creationflags"] = flags
         kwargs.pop("start_new_session", None)
-    with log_file.open("ab") as log:
-        process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, close_fds=True, **kwargs)
+    try:
+        log = log_file.open("ab")
+    except OSError:
+        log_file = None
+        log = None
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=log if log is not None else subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+            **kwargs,
+        )
+    finally:
+        if log is not None:
+            log.close()
     return process.pid, log_file
 
 
@@ -1743,7 +1769,8 @@ def command_open(args: argparse.Namespace, script_file: Path) -> int:
                 break
             time.sleep(0.1)
         else:
-            raise WorkbenchError("SERVER_UNAVAILABLE", f"服务启动失败，请查看日志：{log_file}", 500)
+            where = f"，请查看日志：{log_file}" if log_file is not None else "（没有可写的日志目录，输出已丢弃）"
+            raise WorkbenchError("SERVER_UNAVAILABLE", f"服务启动失败{where}", 500)
     query = urllib.parse.urlencode({"file": str(target)})
     print(json.dumps({
         "ok": True,

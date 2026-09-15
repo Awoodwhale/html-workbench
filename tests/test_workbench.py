@@ -487,6 +487,60 @@ class FileReferenceTests(unittest.TestCase):
             self.assertTrue(log_file.is_file(), f"log written to {directory}")
             self.assertIn("hello world", log_file.read_text(encoding="utf-8"))
 
+    def test_setup_logging_survives_when_no_directory_is_writable(self):
+        # The whole point of the fallback chain is that the service still binds
+        # its port. If EVERY candidate refuses writes, losing the file log is
+        # acceptable; refusing to start is the bug this replaced.
+        with mock.patch.object(workbench, "make_temp_file", side_effect=PermissionError(13, "denied")), \
+             mock.patch.object(workbench.Path, "mkdir"):
+            logger, directory = workbench.setup_logging("/definitely/not/writable/logs", 4399)
+
+        self.assertEqual(directory, Path("/definitely/not/writable/logs"))
+        self.assertFalse(
+            any(isinstance(handler, workbench.RotatingFileHandler) for handler in logger.handlers),
+            "an unopenable log file must leave no handler behind",
+        )
+        # And the logger stays usable: a call must not raise.
+        logger.info("service continues without a file log")
+
+
+class DetachedStartTests(unittest.TestCase):
+    """`open` spawns `serve`; an uncapturable console must not block the spawn."""
+
+    def spawn(self, log_dir):
+        spawned = {}
+
+        def fake_popen(command, **kwargs):
+            spawned["command"] = command
+            spawned["stdout"] = kwargs.get("stdout")
+            return mock.Mock(pid=4242)
+
+        with mock.patch.object(workbench.subprocess, "Popen", fake_popen):
+            pid, log_file = workbench.start_detached(
+                Path(__file__), 4399, Path.cwd(), None,
+                Path(log_dir) / "vendor", Path(log_dir) / "logs",
+            )
+        return pid, log_file, spawned
+
+    def test_captures_output_when_a_directory_accepts_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pid, log_file, spawned = self.spawn(tmp)
+
+        self.assertEqual(pid, 4242)
+        self.assertIsNotNone(log_file)
+        self.assertEqual(log_file.name, "html-workbench-4399.log")
+        self.assertIn("--log-dir", spawned["command"])
+
+    def test_starts_without_a_log_when_the_file_cannot_be_opened(self):
+        with mock.patch.object(workbench, "make_temp_file", side_effect=PermissionError(13, "denied")), \
+             mock.patch.object(workbench.Path, "mkdir"):
+            pid, log_file, spawned = self.spawn("/definitely/not/writable")
+
+        self.assertEqual(pid, 4242)
+        # No path to report, and the child's output goes nowhere — but it RUNS.
+        self.assertIsNone(log_file)
+        self.assertEqual(spawned["stdout"], workbench.subprocess.DEVNULL)
+
 
 class WritableDirectoryTests(unittest.TestCase):
     """Runtime directories must be probed, and a refused probe must fail fast.

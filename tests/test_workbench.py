@@ -624,5 +624,57 @@ class WritableDirectoryTests(unittest.TestCase):
         self.assertEqual(candidates[1], Path("/granted") / workbench.RUNTIME_DIR_NAME / "vendor")
 
 
+class SelfIgnoreTests(unittest.TestCase):
+    """The runtime root hides itself from git.
+
+    It normally lands inside the session workspace, which is usually the USER's
+    repository — not ours. Starting the service must not dirty their `git status`
+    with logs and a re-downloadable cache, and it cannot rely on them having
+    added an ignore rule for a directory our plugin chose.
+    """
+
+    def test_marks_the_runtime_root_it_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp) / workbench.RUNTIME_DIR_NAME / "logs"
+            chosen = workbench.pick_writable_dir(logs)
+
+            self.assertEqual(chosen, logs)
+            # On the ROOT, not the leaf: one marker covers logs/ and vendor/ both.
+            marker = Path(tmp) / workbench.RUNTIME_DIR_NAME / ".gitignore"
+            self.assertTrue(marker.is_file(), "the runtime root must ignore itself")
+            # `*` also excludes the marker itself, so nothing shows up at all.
+            self.assertIn("*", marker.read_text(encoding="utf-8").split())
+            self.assertFalse((logs / ".gitignore").exists(), "the leaf needs no marker")
+
+    def test_never_marks_a_directory_outside_the_runtime_root(self):
+        # `--log-dir .` points straight at a source tree. Writing a `.gitignore`
+        # containing `*` there would make git ignore the user's entire project.
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = Path(tmp) / "not-runtime-state"
+            workbench.pick_writable_dir(plain)
+
+            self.assertFalse((plain / ".gitignore").exists())
+            self.assertFalse((Path(tmp) / ".gitignore").exists())
+
+    def test_keeps_an_existing_marker_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / workbench.RUNTIME_DIR_NAME
+            root.mkdir()
+            marker = root / ".gitignore"
+            marker.write_text("hand-written\n", encoding="utf-8")
+
+            workbench.pick_writable_dir(root / "logs")
+
+            self.assertEqual(marker.read_text(encoding="utf-8"), "hand-written\n")
+
+    def test_an_unwritable_marker_does_not_fail_the_start(self):
+        # Losing the ignore rule is cosmetic; the repository-level `.gitignore`
+        # still covers our own checkout. Refusing to serve would not be cosmetic.
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp) / workbench.RUNTIME_DIR_NAME / "logs"
+            with mock.patch.object(workbench.Path, "write_text", side_effect=PermissionError(13, "denied")):
+                self.assertEqual(workbench.pick_writable_dir(logs), logs)
+
+
 if __name__ == "__main__":
     unittest.main()

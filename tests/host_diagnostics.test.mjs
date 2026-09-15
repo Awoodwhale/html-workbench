@@ -328,3 +328,24 @@ test('host and service agree on one runtime folder name', () => {
     assert.ok(source.includes(declared[1]), `${name} must reference ${declared[1]}`)
   }
 })
+
+test('the host marks the runtime directory it probes as git-ignored', async () => {
+  // The probe CREATES the directory, and it usually lands in the user's own
+  // repository. Whichever half gets there first must hide it, or simply opening
+  // the panel leaves an untracked folder in someone else's `git status`.
+  const { mkdtempSync, existsSync, readFileSync: read } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const workspace = mkdtempSync(resolve(tmpdir(), 'hwb-probe-'))
+  const previous = process.cwd()
+  try {
+    process.chdir(workspace)
+    // Fresh module registry: `runtimeDir` is resolved once at import time.
+    await import(`../dsh-plugin/src/index.js?probe=${Date.now()}`)
+
+    const marker = resolve(workspace, '.html-workbench', '.gitignore')
+    assert.ok(existsSync(marker), 'the probed runtime directory must ignore itself')
+    assert.match(read(marker, 'utf8'), /^\*$/m)
+  } finally {
+    process.chdir(previous)
+  }
+})

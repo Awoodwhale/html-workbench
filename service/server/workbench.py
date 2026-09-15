@@ -173,6 +173,31 @@ def make_temp_file(directory: Path, prefix: str, suffix: str = "") -> tuple[int,
     raise FileExistsError(f"无法在 {directory} 创建临时文件：连续的文件名冲突")
 
 
+def self_ignore(directory: Path) -> None:
+    """Make a runtime directory invisible to git, best effort.
+
+    The runtime root usually lands inside the session workspace, which for most
+    users is a repository: without this, every start dirties `git status` with a
+    folder holding nothing but logs and a re-downloadable cache, and the noise
+    lands in the user's own project rather than ours. A `.gitignore` containing
+    `*` excludes the tree including that file, so nothing has to be added to the
+    repository's own ignore rules.
+
+    Only the runtime root is marked — never an arbitrary directory the caller
+    happened to pass, which may be the user's source tree (`--log-dir .`).
+    """
+    root = next((parent for parent in (directory, *directory.parents) if parent.name == RUNTIME_DIR_NAME), None)
+    if root is None:
+        return
+    marker = root / ".gitignore"
+    if marker.exists():
+        return
+    try:
+        marker.write_text("# Created by html-workbench: disposable logs and cache.\n*\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def pick_writable_dir(*candidates: Path) -> Path:
     """Return the first candidate directory this process can really write into.
 
@@ -202,6 +227,7 @@ def pick_writable_dir(*candidates: Path) -> Path:
             probe.unlink()
         except OSError:
             pass
+        self_ignore(candidate)
         return candidate
     return fallback if fallback is not None else Path.cwd()
 

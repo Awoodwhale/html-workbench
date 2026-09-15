@@ -8,7 +8,7 @@
  * resolved relative to THIS module (`import.meta.url`) — never hard-coded to a
  * specific machine — and handed to the shared body as `config.script`.
  */
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -30,6 +30,11 @@ const RUNTIME_DIR_NAME = '.html-workbench'
  * ambient %TEMP% root the parent sees. Probing by an actual create is the only
  * test that reflects what a child can do, and the probe must fail fast (see
  * `make_temp_file` in workbench.py for why `tempfile.mkstemp` is unusable here).
+ *
+ * A successful probe leaves the directory behind, so it is marked ignored right
+ * away: the runtime root normally sits in the user's own repository, and probing
+ * must not be what dirties their `git status` (see `self_ignore` in workbench.py,
+ * which does the same for the directory the service settles on).
  */
 const probeWritableDir = (dir) => {
   try {
@@ -37,6 +42,9 @@ const probeWritableDir = (dir) => {
     const probe = join(dir, '.wb-write-probe-' + process.pid)
     writeFileSync(probe, '')
     rmSync(probe, { force: true })
+    if (!existsSync(join(dir, '.gitignore'))) {
+      writeFileSync(join(dir, '.gitignore'), '# Created by html-workbench: disposable logs and cache.\n*\n')
+    }
     return true
   } catch (e) {
     return false

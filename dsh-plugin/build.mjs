@@ -70,6 +70,20 @@ const bundle = `window.__ModuleLoader__.load({
           } catch (error) {
             throw new Error('本地服务返回了无法解析的 JSON（HTTP ' + response.status + '）。');
           }
+        }, (error) => {
+          // fetch REJECTS (rather than resolving with a status) when the request
+          // never reached DSH's web server. Left alone, the browser's bare
+          // "Failed to fetch" surfaced in the panel — the single least actionable
+          // string in this plugin, and the one users reported. It also means the
+          // host half never ran, so none of its diagnostics exist yet: the only
+          // useful thing to report is WHICH request died and what to check.
+          const reason = (error && error.message) || String(error);
+          throw new Error(
+            '无法连接 HTML Workbench 后台（' + method + '）。请求 ' + url + ' 没有到达 DSH。'
+            + '通常说明插件的 Node 半没有加载成功，或 DSH 尚未重启以注册该路由。'
+            + '请完全重启 DSH；若仍失败，请在启动 DSH 的终端里查找 [html-workbench] 开头的报错。'
+            + '（底层错误：' + reason + '）'
+          );
         });
       },
     };

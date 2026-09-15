@@ -15,6 +15,9 @@ import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const scriptPath = resolve(here, '..', 'scripts', 'workbench.py')
+// The panel shows this next to the diagnostics so a pasted report says WHICH
+// build produced it — without it, every bug report needs a follow-up question.
+const version = JSON.parse(readFileSync(resolve(here, '..', 'package.json'), 'utf8')).version
 
 // Must match RUNTIME_DIR_NAME in scripts/workbench.py, so the host's first guess
 // and the service's own in-process fallback land in the SAME folder instead of
@@ -88,5 +91,6 @@ export const inject = plugin.inject ?? []
 export const apply = (ctx, config) => plugin.apply(ctx, {
   script: scriptPath,
   runtimeDir,
+  version,
   ...(config || {}),
 })

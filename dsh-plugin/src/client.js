@@ -98,6 +98,7 @@ header:has([data-slot="conversation.session.header.utilities"]) {
 .hwb-diag-row + .hwb-diag-row { border-top: 1px solid color-mix(in srgb, var(--dsw-alias-border-l2) 50%, transparent); }
 .hwb-diag-time { color: var(--dsw-alias-label-tertiary); font-family: var(--hwb-mono); font-size: 10.5px; padding-top: 1px; }
 .hwb-diag-msg { min-width: 0; }
+.hwb-diag-count { margin-left: 6px; padding: 0 5px; border-radius: 999px; background: var(--dsw-alias-bg-base); color: var(--dsw-alias-label-tertiary); font-family: var(--hwb-mono); font-size: 10px; }
 .hwb-diag-row[data-level="error"] .hwb-diag-msg { color: var(--dsw-alias-state-error-primary); }
 .hwb-diag-detail { display: block; margin-top: 3px; padding: 6px 8px; border-radius: 6px; background: var(--dsw-alias-bg-base); color: var(--dsw-alias-label-secondary); font-family: var(--hwb-mono); font-size: 10.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow-y: auto; }
 .hwb-diag-empty { padding: 16px 14px; color: var(--dsw-alias-label-tertiary); font-size: 11.5px; }
@@ -620,8 +621,12 @@ header:has([data-slot="conversation.session.header.utilities"]) {
           if (!res.isHtml) store.set({ resolveState: 'invalid' })
           else if (res.exists === true) store.set({ resolveState: 'exists' })
           else if (res.exists === false) store.set({ resolveState: 'missing' })
+          // `exists: null` means the CHECK could not run (no interpreter, no
+          // shell). Staying silent made the field look unresponsive, so promote
+          // the host's reason to the banner instead of dropping it.
+          else if (res.error) store.set({ resolveState: 'idle', error: res.error })
           else store.set({ resolveState: 'idle' })
-        }).catch(() => store.set({ resolveState: 'idle' }))
+        }).catch((e) => store.set({ resolveState: 'idle', error: String(e && e.message ? e.message : e) }))
       }, 300)
     }
 
@@ -674,6 +679,7 @@ header:has([data-slot="conversation.session.header.utilities"]) {
       const s = useStore()
       const d = s.diag
       const journal = (d && d.journal) || []
+      const [copied, setCopied] = React.useState(false)
 
       const fact = (key, value) => value == null || value === ''
         ? null
@@ -682,10 +688,53 @@ header:has([data-slot="conversation.session.header.utilities"]) {
           React.createElement('span', { className: 'hwb-diag-val', key: key + '-v' }, String(value)),
         ]
 
+      // A bug report is only useful if it carries the journal. Asking a user to
+      // screenshot a scrolling panel loses exactly the detail lines that matter,
+      // so hand them one paste-ready block instead — plain text, not JSON, so it
+      // survives being dropped into a chat window.
+      const copyReport = () => {
+        const lines = ['# HTML Workbench 诊断报告']
+        if (d) {
+          lines.push('插件版本: ' + (d.version || '未知（可能是动态热加载）'))
+          lines.push('平台: ' + (d.platform || '未知'))
+          lines.push('状态: ' + (d.running ? '运行中' : '未就绪'))
+          lines.push('端口: ' + d.port)
+          lines.push('进程: ' + (d.processStatus || '未由本插件启动')
+            + (d.exitCode == null ? '' : '（exit=' + d.exitCode + '）'))
+          lines.push('Python: ' + (d.pythonCommand || (d.pythonCandidates || []).join(' → ') || '未解析'))
+          lines.push('脚本: ' + (d.script || '未配置'))
+          lines.push('运行目录: ' + (d.runtimeDir || '未知'))
+          if (d.startError) lines.push('失败原因: ' + d.startError)
+        } else {
+          lines.push('（后台未返回诊断信息，通常说明请求根本没有到达 DSH）')
+        }
+        if (s.error) lines.push('界面报错: ' + s.error)
+        lines.push('', '## 日志（最新在前）')
+        if (journal.length) {
+          journal.forEach((entry) => {
+            lines.push('[' + clockTime(entry.at) + '] ' + entry.level + ': ' + entry.message)
+            if (entry.detail) lines.push('    ' + String(entry.detail).replace(/\n/g, '\n    '))
+          })
+        } else {
+          lines.push('（无）')
+        }
+        const text = lines.join('\n')
+        const done = () => { setCopied(true); setTimeout(() => setCopied(false), 1600) }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(text).then(done, () => store.set({ error: '复制失败，请手动访问 /html-workbench/diagnostics 获取原始信息。' }))
+        } else {
+          store.set({ error: '当前环境不支持剪贴板，请访问 /html-workbench/diagnostics 获取原始信息。' })
+        }
+      }
+
       return React.createElement('div', { className: 'hwb-diag' },
         React.createElement('div', { className: 'hwb-diag-head' },
           React.createElement('span', { className: 'hwb-diag-title' }, '服务诊断'),
           React.createElement('span', { className: 'hwb-spacer' }),
+          React.createElement('button', {
+            type: 'button', className: 'hwb-btn hwb-btn-quiet hwb-btn-sm',
+            onClick: copyReport, title: '复制完整诊断信息，便于反馈问题',
+          }, copied ? '已复制' : '复制报告'),
           React.createElement('button', {
             type: 'button', className: 'hwb-btn hwb-btn-quiet hwb-btn-sm',
             disabled: s.restarting, onClick: restartService,
@@ -700,8 +749,11 @@ header:has([data-slot="conversation.session.header.utilities"]) {
             fact('状态', d.running ? '运行中' : (d.processStatus === 'running' ? '启动中' : '未就绪')),
             fact('端口', d.port),
             fact('进程', d.processStatus ? d.processStatus + (d.exitCode == null ? '' : '（exit=' + d.exitCode + '）') : '未由本插件启动'),
+            fact('Python', d.pythonCommand || ((d.pythonCandidates || []).join(' → ') || null)),
+            fact('运行目录', d.runtimeDir),
             fact('失败原因', d.startError),
             fact('脚本', d.script),
+            fact('版本', d.version ? d.version + (d.platform ? ' · ' + d.platform : '') : d.platform),
             d.hasShell === false ? fact('shell', '不可用') : null,
           )
           : null,
@@ -713,6 +765,11 @@ header:has([data-slot="conversation.session.header.utilities"]) {
               React.createElement('span', { className: 'hwb-diag-time' }, clockTime(entry.at)),
               React.createElement('span', { className: 'hwb-diag-msg' },
                 entry.message,
+                // Folded duplicates would otherwise read as a single occurrence,
+                // hiding that the user retried and hit the same wall every time.
+                entry.repeated > 1
+                  ? React.createElement('span', { className: 'hwb-diag-count' }, '×' + entry.repeated)
+                  : null,
                 entry.detail ? React.createElement('span', { className: 'hwb-diag-detail' }, entry.detail) : null,
               ),
             ))

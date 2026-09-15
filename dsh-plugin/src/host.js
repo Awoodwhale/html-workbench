@@ -28,6 +28,20 @@ return {
     const PORT = opts.port || 4317
     const SCRIPT = opts.script || null
     const EDITOR_ROOT = opts.editorRoot || null
+    const PLATFORM = opts.platform || (typeof process !== 'undefined' ? process.platform : null)
+    const IS_WINDOWS = PLATFORM === 'win32'
+    // Reported verbatim in the diagnostics. A dynamic (cordis_define) load has no
+    // config, so `version` stays null — which is itself the answer to "is this the
+    // packaged build or a hot-loaded one?", the first question every report raises.
+    const VERSION = opts.version || null
+    // Candidates must be a SINGLE executable token: every call site appends its
+    // own arguments, so a multi-token entry like `py -3` would place the script
+    // path after the launcher's own flags and break argument forwarding. The `py`
+    // launcher is still supported — see `expandWindowsLauncher`, which asks it for
+    // the interpreter's absolute path and uses that instead.
+    const PYTHON_CANDIDATES = opts.pythonCommand
+      ? [opts.pythonCommand]
+      : (IS_WINDOWS ? ['python3', 'python'] : ['python3'])
     // Static packages inject the runtime directory resolved (and probed) by
     // src/index.js. Keep a dynamic-loader fallback too: TEMP/TMPDIR cover
     // Windows/macOS/Linux; only the final fallback is POSIX because dynamic
@@ -36,7 +50,14 @@ return {
     const tempRoot = typeof process !== 'undefined' && process.env
       ? (process.env.TEMP || process.env.TMP || process.env.TMPDIR)
       : null
-    const RUNTIME_DIR = opts.runtimeDir || (tempRoot ? tempRoot.replace(/[\\/]$/, '') + '/.html-workbench' : '/tmp/.html-workbench')
+    // Strip a trailing separator from EITHER source: `%TEMP%` and an injected
+    // runtimeDir both legitimately end in one, and appending '/logs' to it would
+    // yield `C:\Temp\hwb\/logs` — a path Python tolerates but that reads as
+    // corruption in every log line and error message a user pastes back.
+    const trimSeparator = (value) => String(value).replace(/[\\/]+$/, '')
+    const RUNTIME_DIR = opts.runtimeDir
+      ? trimSeparator(opts.runtimeDir)
+      : (tempRoot ? trimSeparator(tempRoot) + '/.html-workbench' : '/tmp/.html-workbench')
 
     // These are REQUESTS, not guarantees. The service runs as a DSH sandboxed
     // child that may write only the session workspace and a private temp folder
@@ -58,6 +79,14 @@ return {
     let ownedProcess = null
     let serviceRunning = false
     let startError = null
+    let pythonCommand = opts.pythonCommand || (IS_WINDOWS ? null : 'python3')
+    // A failed probe must be remembered: `resolve` runs on every keystroke and
+    // `health` on a timer, so re-probing would spawn three 5s subprocesses per
+    // call and flood the journal with one repeated line. The TTL still lets a
+    // user who just installed Python recover without reloading the plugin.
+    const PROBE_RETRY_MS = 30000
+    let pythonProbeFailedAt = 0
+    let pythonProbe = null
     let disposed = false
 
     const shell = ctx.get('shell')
@@ -70,17 +99,59 @@ return {
     // subprocess outcome now lands in this ring buffer, which `status` returns
     // and the panel renders, so the failure is readable where it is observed.
     const JOURNAL_LIMIT = 40
+    // Errors are the whole point of the journal, yet they are also the rarest
+    // entries: a service that fails at start then gets polled by `status` every
+    // few seconds would push the original traceback out of a plain ring buffer
+    // long before anyone opens the panel. So evict by level — drop the oldest
+    // non-error first, and only sacrifice an error when nothing else is left.
+    const JOURNAL_ERROR_FLOOR = 12
     let journal = []
 
+    const trimJournal = () => {
+      if (journal.length <= JOURNAL_LIMIT) return
+      const overflow = journal.length - JOURNAL_LIMIT
+      let dropped = 0
+      const errors = journal.filter((entry) => entry.level === 'error').length
+      const keep = []
+      for (let i = 0; i < journal.length; i += 1) {
+        const entry = journal[i]
+        const isError = entry.level === 'error'
+        // Never let noise starve the error history, but do not grow without
+        // bound either: past the floor, errors age out like anything else.
+        const expendable = !isError || errors - dropped > JOURNAL_ERROR_FLOOR
+        if (dropped < overflow && expendable) {
+          dropped += 1
+          continue
+        }
+        keep.push(entry)
+      }
+      // Errors alone can exceed the limit; fall back to a plain tail so the
+      // buffer still has a hard ceiling.
+      journal = keep.length > JOURNAL_LIMIT ? keep.slice(-JOURNAL_LIMIT) : keep
+    }
+
     const note = (level, message, detail) => {
-      journal.push({
-        at: Date.now(),
-        level: level,
-        message: String(message || ''),
-        detail: detail ? String(detail).slice(0, 4000) : null,
-      })
-      if (journal.length > JOURNAL_LIMIT) journal = journal.slice(-JOURNAL_LIMIT)
-      if (level === 'error') console.error('[html-workbench] ' + message, detail || '')
+      const text = String(message || '')
+      const body = detail ? String(detail).slice(0, 4000) : null
+      // Retrying a broken start replays the SAME failure verbatim, interleaved
+      // with the "restarting" line — so consecutive-only folding would miss it.
+      // Match anywhere, then move the entry to the end so its position still
+      // agrees with its timestamp when the panel renders newest-first.
+      let index = -1
+      for (let i = journal.length - 1; i >= 0; i -= 1) {
+        const entry = journal[i]
+        if (entry.level === level && entry.message === text && entry.detail === body) { index = i; break }
+      }
+      if (index >= 0) {
+        const entry = journal.splice(index, 1)[0]
+        entry.at = Date.now()
+        entry.repeated = (entry.repeated || 1) + 1
+        journal.push(entry)
+      } else {
+        journal.push({ at: Date.now(), level: level, message: text, detail: body })
+        trimJournal()
+      }
+      if (level === 'error') console.error('[html-workbench] ' + text, body || '')
     }
 
     // `CollectedOutput` carries more than text (truncation flags, spill paths);
@@ -91,6 +162,25 @@ return {
       const trimmed = String(text).trim()
       if (collected && collected.truncated) return trimmed + '\n…（输出被截断）'
       return trimmed
+    }
+
+    // `shell.resolve({ command })` takes ONE command line, so every embedded path
+    // must be quoted for the platform's parser. Naive `'"' + p + '"'` breaks on
+    // Windows, where `C:\dir\` ends in a backslash that escapes the closing quote
+    // and swallows the rest of the line. Never use JSON.stringify here: it emits
+    // JSON escapes (`\\`), which cmd.exe passes through verbatim, so Python
+    // receives a path with doubled separators and reports every file as missing.
+    const quoteArg = (value) => {
+      const raw = String(value == null ? '' : value)
+      if (IS_WINDOWS) {
+        // Double only the run of backslashes that precedes the closing quote;
+        // interior ones are literal to cmd.exe. Inner quotes cannot appear in a
+        // Windows path, but strip them rather than emit an unbalanced line.
+        const cleaned = raw.replace(/"/g, '')
+        const tail = cleaned.match(/\\*$/)[0]
+        return '"' + cleaned + tail + '"'
+      }
+      return "'" + raw.replace(/'/g, "'\\''") + "'"
     }
 
     const describeRun = (result) => {
@@ -104,10 +194,76 @@ return {
       return parts.join(' ') + (streams.length ? '\n' + streams.join('\n') : '')
     }
 
+    // Windows ships a `py` launcher that resolves versions the PATH may not
+    // expose. It is NOT usable as a command prefix (`py -3 script.py` mangles
+    // forwarded arguments), so ask it for the interpreter's absolute path and use
+    // that as a normal single-token executable.
+    const expandWindowsLauncher = async () => {
+      if (!IS_WINDOWS || !shell) return null
+      const probe = 'py -3 -c ' + quoteArg('import sys; print(sys.executable)')
+      try {
+        const result = await shell.run(shell.resolve({ command: probe, timeoutMs: 5000, stdoutMaxBytes: 4096 }))
+        if (!result || result.exitCode !== 0) return { failure: 'py -3: ' + describeRun(result) }
+        const executable = outputText(result.stdout).split('\n').pop().trim()
+        if (!executable) return { failure: 'py -3: 没有返回解释器路径' }
+        return { command: quoteArg(executable) }
+      } catch (e) {
+        return { failure: 'py -3: ' + ((e && e.message) || String(e)) }
+      }
+    }
+
+    const resolvePythonCommand = async () => {
+      if (pythonCommand) return pythonCommand
+      if (!shell) return null
+      // Collapse concurrent callers onto one probe: the panel's poll, an `open`
+      // and a keystroke-driven `resolve` can all arrive inside the same tick.
+      if (pythonProbe) return pythonProbe
+      if (pythonProbeFailedAt && Date.now() - pythonProbeFailedAt < PROBE_RETRY_MS) return null
+      pythonProbe = (async () => {
+        const failures = []
+        for (const candidate of PYTHON_CANDIDATES) {
+          try {
+            const spec = shell.resolve({ command: candidate + ' --version', timeoutMs: 5000, stdoutMaxBytes: 4096 })
+            const result = await shell.run(spec)
+            if (result && result.exitCode === 0) {
+              pythonCommand = candidate
+              pythonProbeFailedAt = 0
+              note('info', '使用 Python 解释器：' + candidate)
+              return pythonCommand
+            }
+            failures.push(candidate + ': ' + describeRun(result))
+          } catch (e) {
+            failures.push(candidate + ': ' + ((e && e.message) || String(e)))
+          }
+        }
+        const launcher = await expandWindowsLauncher()
+        if (launcher && launcher.command) {
+          pythonCommand = launcher.command
+          pythonProbeFailedAt = 0
+          note('info', '使用 Python 解释器（经 py 启动器解析）：' + launcher.command)
+          return pythonCommand
+        }
+        if (launcher && launcher.failure) failures.push(launcher.failure)
+        pythonProbeFailedAt = Date.now()
+        startError = '找不到可用的 Python 3 解释器（已尝试：'
+          + PYTHON_CANDIDATES.join('、') + (IS_WINDOWS ? '、py -3' : '')
+          + '）。请安装 Python 3.9+ 并确保它在 PATH 中，然后点「重启服务」。'
+        note('error', startError, failures.join('\n'))
+        return null
+      })()
+      try {
+        return await pythonProbe
+      } finally {
+        pythonProbe = null
+      }
+    }
+
     const runCli = async (args, timeoutMs) => {
       if (!shell) { note('error', 'shell 服务不可用，无法执行 workbench.py'); return null }
       if (!SCRIPT) { note('error', 'workbench.py 路径未配置'); return null }
-      const command = 'python3 "' + SCRIPT + '" ' + args
+      const python = await resolvePythonCommand()
+      if (!python) return null
+      const command = python + ' ' + quoteArg(SCRIPT) + ' ' + args
       try {
         const spec = shell.resolve({ command: command, timeoutMs: timeoutMs || 15000, stdoutMaxBytes: 64 * 1024 })
         const result = await shell.run(spec)
@@ -125,9 +281,11 @@ return {
     // the journal — poll quietly and let the caller decide what is worth noting.
     const probeHealth = async () => {
       if (!shell || !SCRIPT) return null
+      const python = await resolvePythonCommand()
+      if (!python) return null
       try {
         const spec = shell.resolve({
-          command: 'python3 "' + SCRIPT + '" health --port ' + PORT,
+          command: python + ' ' + quoteArg(SCRIPT) + ' health --port ' + PORT,
           timeoutMs: 8000,
           stdoutMaxBytes: 64 * 1024,
         })
@@ -222,11 +380,13 @@ return {
       }
       if (!shell) { startError = 'shell 服务不可用（DSH 未提供 shell，插件无法拉起本地服务）'; note('error', startError); return null }
       if (!SCRIPT) { startError = 'workbench.py 路径未配置（请用静态装载并随包分发 scripts/workbench.py）'; note('error', startError); return null }
+      const python = await resolvePythonCommand()
+      if (!python) return null
       let proc = null
-      const command = 'python3 "' + SCRIPT + '" serve --port ' + PORT
-        + ' --log-dir "' + LOG_DIR + '"'
-        + ' --vendor-cache "' + VENDOR_CACHE + '"'
-        + (EDITOR_ROOT ? ' --editor-root "' + EDITOR_ROOT + '"' : '')
+      const command = python + ' ' + quoteArg(SCRIPT) + ' serve --port ' + PORT
+        + ' --log-dir ' + quoteArg(LOG_DIR)
+        + ' --vendor-cache ' + quoteArg(VENDOR_CACHE)
+        + (EDITOR_ROOT ? ' --editor-root ' + quoteArg(EDITOR_ROOT) : '')
       try {
         note('info', '启动本地服务：端口 ' + PORT, command)
         proc = shell.start(shell.resolve({ command: command, stdoutMaxBytes: 64 * 1024 }))
@@ -324,10 +484,14 @@ return {
         ok: true,
         running: serviceRunning,
         owned: !!ownedProcess,
+        version: VERSION,
+        platform: PLATFORM,
         port: PORT,
         script: SCRIPT,
         editorRoot: EDITOR_ROOT,
         runtimeDir: RUNTIME_DIR,
+        pythonCommand: pythonCommand,
+        pythonCandidates: PYTHON_CANDIDATES.slice(),
         // Where the service really writes, once it has told us. The requested
         // paths stand in only until then: they may be exactly what the sandbox
         // refused, and showing them after the fact is what made a working service
@@ -442,14 +606,24 @@ return {
       if (!trimmed) return { ok: true, empty: true, isHtml: false, exists: false }
       const normalized = normalizeFileReference(trimmed)
       if (!/\.html?$/i.test(normalized)) return { ok: true, isHtml: false, exists: false }
-      if (!shell) return { ok: true, isHtml: true, exists: null }
-      const arg = JSON.stringify(normalized)
-      const spec = shell.resolve({ command: 'python3 -c "import os,sys; sys.exit(0 if os.path.isfile(sys.argv[1]) else 1)" ' + arg, timeoutMs: 5000, stdoutMaxBytes: 1024 })
+      if (!shell) return { ok: true, isHtml: true, exists: null, normalized: normalized }
+      const python = await resolvePythonCommand()
+      // Say WHY the check could not run. Returning a bare `exists: null` renders
+      // as no indicator at all, which reads as "the field is ignoring me".
+      if (!python) {
+        return { ok: true, isHtml: true, exists: null, normalized: normalized, error: startError }
+      }
+      const probe = 'import os,sys; sys.exit(0 if os.path.isfile(sys.argv[1]) else 1)'
+      const spec = shell.resolve({
+        command: python + ' -c ' + quoteArg(probe) + ' ' + quoteArg(normalized),
+        timeoutMs: 5000,
+        stdoutMaxBytes: 1024,
+      })
       try {
         const r = await shell.run(spec)
         return { ok: true, isHtml: true, exists: !!(r && r.exitCode === 0), normalized: normalized }
       } catch (e) {
-        return { ok: true, isHtml: true, exists: null, normalized: normalized }
+        return { ok: true, isHtml: true, exists: null, normalized: normalized, error: (e && e.message) || String(e) }
       }
     }
 
@@ -459,13 +633,45 @@ return {
       return base
     }
 
+    const statusPayload = async () => {
+      const h = await health()
+      const out = diagnostics()
+      out.ok = !!h
+      out.running = !!h
+      out.info = h || null
+      return out
+    }
+
+    // `diagnostics()` supervises the child process and revalidates the service,
+    // so it can itself throw (a dead handle, a shell that rejects). Since it is
+    // the payload every error path attaches, it must never be the thing that
+    // turns a readable failure back into an opaque one.
+    const safeDiagnostics = () => {
+      try {
+        return diagnostics()
+      } catch (error) {
+        return {
+          ok: false,
+          degraded: true,
+          error: '收集诊断信息时出错：' + ((error && error.message) || String(error)),
+          version: VERSION,
+          platform: PLATFORM,
+          port: PORT,
+          script: SCRIPT,
+          runtimeDir: RUNTIME_DIR,
+          startError: startError,
+          journal: journal.slice().reverse(),
+        }
+      }
+    }
+
     // 动态传输：Package-private RPC（仅动态运行时存在 harness）。
     if (typeof harness !== 'undefined') {
       harness.handle('list', () => listPayload())
-      harness.handle('status', async () => { const h = await health(); const out = diagnostics(); out.ok = !!h; out.running = !!h; out.info = h || null; return out })
+      harness.handle('status', () => statusPayload())
       harness.handle('open', async (args) => openFile(args && args.file))
       harness.handle('resolve', async (args) => resolvePath(args && args.file))
-      harness.handle('diagnostics', () => diagnostics())
+      harness.handle('diagnostics', () => safeDiagnostics())
       harness.handle('restart', async () => restartService())
     }
 
@@ -488,58 +694,78 @@ return {
         })
         return out
       }
+      // A handler that throws leaves the request hanging until the browser gives
+      // up, and `fetch` then rejects with a bare "Failed to fetch" — the exact
+      // dead end this plugin's users hit. Always answer, and answer with the
+      // reason plus the journal, so the panel can render something actionable.
+      const guard = (name, handler) => async (req, res) => {
+        try {
+          await handler(req, res)
+        } catch (error) {
+          const reason = (error && error.stack) || (error && error.message) || String(error)
+          note('error', '路由 ' + name + ' 处理失败', reason)
+          try {
+            sendJson(res, 500, {
+              ok: false,
+              error: '插件内部错误（' + name + '）：' + ((error && error.message) || String(error)),
+              detail: reason,
+              diagnostics: safeDiagnostics(),
+            })
+          } catch (_) { /* the socket is already gone; the journal has the reason */ }
+        }
+      }
+      // Registered FIRST and deliberately dependency-free: if anything below
+      // fails to register, this route still answers, which is the only way to
+      // read the failure without access to the terminal that started DSH.
+      ctx.effect(() => webServer.register({
+        kind: 'exact',
+        path: '/html-workbench/diagnostics',
+        handler: guard('diagnostics', (req, res) => sendJson(res, 200, safeDiagnostics())),
+      }), 'html-workbench: diagnostics route')
       ctx.effect(() => webServer.register({
         kind: 'exact',
         path: '/html-workbench/list',
-        handler: (req, res) => sendJson(res, 200, listPayload()),
+        handler: guard('list', (req, res) => sendJson(res, 200, listPayload())),
       }), 'html-workbench: list route')
       ctx.effect(() => webServer.register({
         kind: 'exact',
         path: '/html-workbench/status',
-        handler: async (req, res) => {
-          const h = await health()
-          const out = diagnostics()
-          out.ok = !!h
-          out.running = !!h
-          out.info = h || null
-          sendJson(res, 200, out)
-        },
+        handler: guard('status', async (req, res) => sendJson(res, 200, await statusPayload())),
       }), 'html-workbench: status route')
       ctx.effect(() => webServer.register({
         kind: 'exact',
         path: '/html-workbench/open',
-        handler: async (req, res) => {
+        handler: guard('open', async (req, res) => {
           const file = parseQuery(req).file
           const out = await openFile(file)
           sendJson(res, out.ok ? 200 : 400, out)
-        },
+        }),
       }), 'html-workbench: open route')
       ctx.effect(() => webServer.register({
         kind: 'exact',
         path: '/html-workbench/resolve',
-        handler: async (req, res) => {
+        handler: guard('resolve', async (req, res) => {
           const out = await resolvePath(parseQuery(req).file)
           sendJson(res, out.ok ? 200 : 400, out)
-        },
+        }),
       }), 'html-workbench: resolve route')
-      // Readable straight from a browser tab — the fastest path from "red dot"
-      // to "here is the traceback" without any UI in the way.
-      ctx.effect(() => webServer.register({
-        kind: 'exact',
-        path: '/html-workbench/diagnostics',
-        handler: (req, res) => sendJson(res, 200, diagnostics()),
-      }), 'html-workbench: diagnostics route')
       ctx.effect(() => webServer.register({
         kind: 'exact',
         path: '/html-workbench/restart',
-        handler: async (req, res) => {
+        handler: guard('restart', async (req, res) => {
           const out = await restartService()
           sendJson(res, out.ok ? 200 : 500, out)
-        },
+        }),
       }), 'html-workbench: restart route')
     }
 
     // 注册时主动拉起服务（异步，不阻塞 apply）。
-    void startService()
+    // A rejection here must not escape into Cordis: `apply` has already wired up
+    // the transports, and losing them would take the diagnostics route down with
+    // it — leaving the panel with nothing but "Failed to fetch" again.
+    Promise.resolve().then(startService).catch((error) => {
+      startError = '启动本地服务时发生未预期的错误：' + ((error && error.message) || String(error))
+      note('error', startError, (error && error.stack) || null)
+    })
   },
 }

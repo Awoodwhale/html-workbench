@@ -6,3 +6,8 @@ __pycache__/
 *.pyc
 *.log
 .DS_Store
+
+# Runtime state the service creates beside its working directory when it is run
+# from the repository root: disposable logs + the re-downloadable GrapesJS cache.
+.html-workbench/
+html-workbench-dsh/

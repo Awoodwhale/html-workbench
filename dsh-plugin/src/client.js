@@ -720,7 +720,7 @@ header:has([data-slot="conversation.session.header.utilities"]) {
         ),
         React.createElement('div', { className: 'hwb-diag-hint' },
           '服务自身日志：',
-          React.createElement('code', null, (d && d.logDir) || '/tmp/html-workbench-dsh/logs/'),
+          React.createElement('code', null, (d && d.logDir) || '<工作区>/.html-workbench/logs/'),
           '；也可直接访问 ',
           React.createElement('code', null, '/html-workbench/diagnostics'),
           ' 查看原始 JSON。',

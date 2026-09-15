@@ -28,14 +28,28 @@ dsh-plugin/
 
 `host.js` 默认用本机仓库内的 `skill/html-workbench/scripts/workbench.py` 拉起服务。
 
-### 静态装载（后续发布 NPM 时再接入）
+### 静态装载（已发布 NPM）
 
-`cordis.patch.yml` + `package.json` 的 `dsh.bundle` 已就绪；Client 半的静态 bundle（`window.__ModuleLoader__.load`）尚未接入，动态 Client 已可用。
+`cordis.patch.yml` + `package.json` 的 `dsh.bundle` 把插件作为一层 profile 装载；Client 半由 `npm run build` 打成 `lib/client.js`（`window.__ModuleLoader__.load`）。`prepublishOnly` 会自动构建，所以 `lib/`、`scripts/`、`assets/` 是构建产物、不入库。
 
 ## 服务生命周期（副作用管理）
 
 - **注册时**：`apply` 里异步 `startService()`，先 `health` 探测 `4317`；已在运行则复用（不认领），否则 `shell.start` 后台拉起 `workbench.py serve`。
 - **卸载时**：`ctx.effect` 的 disposer `kill()` 掉本插件自己启动的那个进程；复用的服务不误杀。
+
+## 运行时目录（Windows 沙箱）
+
+服务日志与 GrapesJS 缓存写在 `<工作区>/.html-workbench/`（常量 `RUNTIME_DIR_NAME`，Host 与 `workbench.py` 必须一致）。
+
+这些路径是**请求，不是保证**：服务是 DSH 的沙箱子进程，只能写会话工作区和沙箱交给它的私有临时目录，**系统 `%TEMP%` 根一律拒绝**——即使父进程能建出那个文件夹，子进程也写不进去。因此：
+
+- `workbench.py` 在**自身进程内**用一次真实创建探测候选目录，被拒就立刻换下一个（工作区 → 私有临时目录），并把**实际使用**的目录写进 `/api/health` 的 `logDir` / `vendorCache`；
+- Host 采纳上报值（`adoptResolvedPaths`），于是面板显示的是真实路径，而不是它请求过的路径；复用别的进程启动的服务时同样如此；
+- 探测**不允许重试**：Windows 上 `tempfile.mkstemp` 遇到 `PermissionError` 会用只看 DACL 的 `os.access` 复检、再换随机名重试 10 000 次，会把"1 秒报错"变成"卡住数分钟并烧 CPU"。故改用 `make_temp_file()` 的单次 `O_EXCL` 打开。
+
+日志目录**全部候选都不可写**时，服务挂 `NullHandler` 照常启动：丢一份诊断日志可以接受，端口不 bind 不可以。
+
+工作区通常就是**用户自己的仓库**，所以建出目录的那一半会在运行时根写入内容为 `*` 的 `.gitignore`（`self_ignore()` / `probeWritableDir()`），让整棵树连同该文件一起对 git 隐形——本仓库的 `.gitignore` 只管得住自己的 checkout。判定依据是 `RUNTIME_DIR_NAME` 而非传入目录，否则 `--log-dir .` 会把用户的源码树整个变成被忽略的。
 
 ## RPC 接口（Client → Host）
 

@@ -203,7 +203,10 @@ class HttpTests(unittest.TestCase):
             path = self.root / name
             path.write_bytes(f"test-{name}".encode())
             self.vendor[name] = path
-        self.server = workbench.WorkbenchServer(("127.0.0.1", 0), self.asset, self.root, self.vendor)
+        self.server = workbench.WorkbenchServer(
+            ("127.0.0.1", 0), self.asset, self.root, self.vendor,
+            log_dir=self.root / "logs", vendor_cache=self.root / "vendor",
+        )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
@@ -222,6 +225,11 @@ class HttpTests(unittest.TestCase):
         status, health = self.read_json("/api/health")
         self.assertEqual(status, 200)
         self.assertEqual(health["service"], workbench.SERVICE_NAME)
+        # The host reports these in its diagnostics. A REUSED service leaves it no
+        # startup output, so /api/health is the only way it can learn — and show —
+        # the directories really in use.
+        self.assertEqual(health["logDir"], str(self.root / "logs"))
+        self.assertEqual(health["vendorCache"], str(self.root / "vendor"))
         query = urllib.parse.urlencode({"file": str(self.page)})
         status, document = self.read_json(f"/api/document?{query}")
         self.assertEqual(status, 200)
@@ -470,11 +478,202 @@ class FileReferenceTests(unittest.TestCase):
     def test_setup_logging_writes_rotating_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             port = 4399
-            logger = workbench.setup_logging(tmp, port)
+            logger, directory = workbench.setup_logging(tmp, port)
             logger.info("hello %s", "world")
-            log_file = Path(tmp) / f"workbench-{port}.log"
-            self.assertTrue(log_file.is_file())
+            # The resolved directory comes back so the host can report where the
+            # log really is; asserting the file is INSIDE it states that contract
+            # without assuming the requested directory was the one that won.
+            log_file = directory / f"workbench-{port}.log"
+            self.assertTrue(log_file.is_file(), f"log written to {directory}")
             self.assertIn("hello world", log_file.read_text(encoding="utf-8"))
+
+    def test_setup_logging_survives_when_no_directory_is_writable(self):
+        # The whole point of the fallback chain is that the service still binds
+        # its port. If EVERY candidate refuses writes, losing the file log is
+        # acceptable; refusing to start is the bug this replaced.
+        with mock.patch.object(workbench, "make_temp_file", side_effect=PermissionError(13, "denied")), \
+             mock.patch.object(workbench.Path, "mkdir"):
+            logger, directory = workbench.setup_logging("/definitely/not/writable/logs", 4399)
+
+        self.assertEqual(directory, Path("/definitely/not/writable/logs"))
+        self.assertFalse(
+            any(isinstance(handler, workbench.RotatingFileHandler) for handler in logger.handlers),
+            "an unopenable log file must leave no handler behind",
+        )
+        # And the logger stays usable: a call must not raise.
+        logger.info("service continues without a file log")
+
+
+class DetachedStartTests(unittest.TestCase):
+    """`open` spawns `serve`; an uncapturable console must not block the spawn."""
+
+    def spawn(self, log_dir):
+        spawned = {}
+
+        def fake_popen(command, **kwargs):
+            spawned["command"] = command
+            spawned["stdout"] = kwargs.get("stdout")
+            return mock.Mock(pid=4242)
+
+        with mock.patch.object(workbench.subprocess, "Popen", fake_popen):
+            pid, log_file = workbench.start_detached(
+                Path(__file__), 4399, Path.cwd(), None,
+                Path(log_dir) / "vendor", Path(log_dir) / "logs",
+            )
+        return pid, log_file, spawned
+
+    def test_captures_output_when_a_directory_accepts_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pid, log_file, spawned = self.spawn(tmp)
+
+        self.assertEqual(pid, 4242)
+        self.assertIsNotNone(log_file)
+        self.assertEqual(log_file.name, "html-workbench-4399.log")
+        self.assertIn("--log-dir", spawned["command"])
+
+    def test_starts_without_a_log_when_the_file_cannot_be_opened(self):
+        with mock.patch.object(workbench, "make_temp_file", side_effect=PermissionError(13, "denied")), \
+             mock.patch.object(workbench.Path, "mkdir"):
+            pid, log_file, spawned = self.spawn("/definitely/not/writable")
+
+        self.assertEqual(pid, 4242)
+        # No path to report, and the child's output goes nowhere — but it RUNS.
+        self.assertIsNone(log_file)
+        self.assertEqual(spawned["stdout"], workbench.subprocess.DEVNULL)
+
+
+class WritableDirectoryTests(unittest.TestCase):
+    """Runtime directories must be probed, and a refused probe must fail fast.
+
+    DSH runs the service as a sandboxed child whose restricted token may write
+    only the session workspace and a private temp directory: a folder whose DACL
+    looks writable to `os.access` (the ambient %TEMP% root on Windows) rejects
+    every create with EACCES / WinError 5. `tempfile.mkstemp` misreads that as a
+    taken name and retries 10 000 times, which turned a one-second error into a
+    service that never became healthy while pinning a CPU core — so these tests
+    pin down both the fallback and the fact that nothing retries.
+
+    They stub the file-system calls rather than creating files: a test asserting
+    "this directory refuses writes" must not itself need a writable directory.
+    """
+
+    def test_make_temp_file_raises_immediately_instead_of_retrying(self):
+        attempted = []
+
+        def deny(path, flags, mode=0o777):
+            attempted.append(path)
+            raise PermissionError(13, "Permission denied", str(path))
+
+        with mock.patch.object(workbench.os, "open", deny):
+            with self.assertRaises(PermissionError):
+                workbench.make_temp_file(Path("denied-dir"), prefix=".probe.")
+        # Exactly one attempt: a retry loop here is the bug being prevented.
+        self.assertEqual(len(attempted), 1)
+
+    def test_make_temp_file_retries_only_when_the_name_is_taken(self):
+        attempted = []
+
+        def collide_once(path, flags, mode=0o777):
+            attempted.append(path)
+            if len(attempted) == 1:
+                raise FileExistsError(17, "File exists", str(path))
+            return 7
+
+        with mock.patch.object(workbench.os, "open", collide_once), \
+             mock.patch.object(workbench.os, "close"):
+            descriptor, path = workbench.make_temp_file(Path("probe-dir"), prefix=".probe.")
+
+        # The caller owns the descriptor (pick_writable_dir closes it), so the
+        # function must hand back the one it opened.
+        self.assertEqual(descriptor, 7)
+        self.assertEqual(len(attempted), 2)
+        self.assertEqual(Path(path).parent, Path("probe-dir"))
+        self.assertTrue(Path(path).name.startswith(".probe."))
+
+    def test_pick_writable_dir_skips_a_folder_that_denies_writes(self):
+        denied = Path("denied-dir")
+        allowed = Path("allowed-dir")
+
+        def probe(directory, prefix, suffix=""):
+            if Path(directory) == denied:
+                raise PermissionError(13, "Permission denied", str(directory))
+            return 8, Path(directory) / ".wb-write-probe.fake"
+
+        with mock.patch.object(workbench, "make_temp_file", probe), \
+             mock.patch.object(workbench.Path, "mkdir"), \
+             mock.patch.object(workbench.os, "close"):
+            self.assertEqual(workbench.pick_writable_dir(denied, allowed), allowed)
+
+    def test_pick_writable_dir_falls_back_to_the_first_candidate(self):
+        denied = Path("denied-dir")
+        with mock.patch.object(workbench, "make_temp_file", side_effect=PermissionError(13, "denied")), \
+             mock.patch.object(workbench.Path, "mkdir"):
+            # Nothing is writable: return a deterministic path so the real write
+            # raises something the caller can explain.
+            self.assertEqual(workbench.pick_writable_dir(denied), denied)
+
+    def test_log_candidates_try_the_request_then_the_workspace(self):
+        candidates = workbench.log_candidates("/requested/logs")
+        self.assertEqual(candidates[0], Path("/requested/logs"))
+        self.assertEqual(candidates[1], workbench.runtime_directory() / "logs")
+
+    def test_vendor_cache_follows_the_log_directory_that_won(self):
+        candidates = workbench.vendor_candidates("/requested/vendor", Path("/granted") / workbench.RUNTIME_DIR_NAME / "logs")
+        self.assertEqual(candidates[0], Path("/requested/vendor"))
+        # Beside the directory that accepted the log, whose parent is proven writable.
+        self.assertEqual(candidates[1], Path("/granted") / workbench.RUNTIME_DIR_NAME / "vendor")
+
+
+class SelfIgnoreTests(unittest.TestCase):
+    """The runtime root hides itself from git.
+
+    It normally lands inside the session workspace, which is usually the USER's
+    repository — not ours. Starting the service must not dirty their `git status`
+    with logs and a re-downloadable cache, and it cannot rely on them having
+    added an ignore rule for a directory our plugin chose.
+    """
+
+    def test_marks_the_runtime_root_it_created(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp) / workbench.RUNTIME_DIR_NAME / "logs"
+            chosen = workbench.pick_writable_dir(logs)
+
+            self.assertEqual(chosen, logs)
+            # On the ROOT, not the leaf: one marker covers logs/ and vendor/ both.
+            marker = Path(tmp) / workbench.RUNTIME_DIR_NAME / ".gitignore"
+            self.assertTrue(marker.is_file(), "the runtime root must ignore itself")
+            # `*` also excludes the marker itself, so nothing shows up at all.
+            self.assertIn("*", marker.read_text(encoding="utf-8").split())
+            self.assertFalse((logs / ".gitignore").exists(), "the leaf needs no marker")
+
+    def test_never_marks_a_directory_outside_the_runtime_root(self):
+        # `--log-dir .` points straight at a source tree. Writing a `.gitignore`
+        # containing `*` there would make git ignore the user's entire project.
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = Path(tmp) / "not-runtime-state"
+            workbench.pick_writable_dir(plain)
+
+            self.assertFalse((plain / ".gitignore").exists())
+            self.assertFalse((Path(tmp) / ".gitignore").exists())
+
+    def test_keeps_an_existing_marker_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / workbench.RUNTIME_DIR_NAME
+            root.mkdir()
+            marker = root / ".gitignore"
+            marker.write_text("hand-written\n", encoding="utf-8")
+
+            workbench.pick_writable_dir(root / "logs")
+
+            self.assertEqual(marker.read_text(encoding="utf-8"), "hand-written\n")
+
+    def test_an_unwritable_marker_does_not_fail_the_start(self):
+        # Losing the ignore rule is cosmetic; the repository-level `.gitignore`
+        # still covers our own checkout. Refusing to serve would not be cosmetic.
+        with tempfile.TemporaryDirectory() as tmp:
+            logs = Path(tmp) / workbench.RUNTIME_DIR_NAME / "logs"
+            with mock.patch.object(workbench.Path, "write_text", side_effect=PermissionError(13, "denied")):
+                self.assertEqual(workbench.pick_writable_dir(logs), logs)
 
 
 if __name__ == "__main__":

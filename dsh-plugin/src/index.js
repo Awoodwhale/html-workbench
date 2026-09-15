@@ -8,17 +8,73 @@
  * resolved relative to THIS module (`import.meta.url`) — never hard-coded to a
  * specific machine — and handed to the shared body as `config.script`.
  */
-import { readFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, resolve, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const scriptPath = resolve(here, '..', 'scripts', 'workbench.py')
-// Runtime state must be writable from DSH's workspace-write sandbox. `tmpdir()`
-// is platform-aware: /tmp on macOS/Linux, %TEMP% on Windows. The content is only
-// logs and a re-downloadable GrapesJS cache, so it is deliberately ephemeral.
-const runtimeDir = join(tmpdir(), 'html-workbench-dsh')
+
+// Must match RUNTIME_DIR_NAME in scripts/workbench.py, so the host's first guess
+// and the service's own in-process fallback land in the SAME folder instead of
+// scattering two differently named directories through the user's workspace.
+const RUNTIME_DIR_NAME = '.html-workbench'
+
+/**
+ * Whether this process can really create files in `dir` (mkdir + write + delete).
+ *
+ * A writable-looking DACL proves nothing: DSH runs the Python service as a
+ * sandboxed child whose restricted token may write only the session workspace and
+ * a private temp directory it hands the child through TEMP/TMP — never the
+ * ambient %TEMP% root the parent sees. Probing by an actual create is the only
+ * test that reflects what a child can do, and the probe must fail fast (see
+ * `make_temp_file` in workbench.py for why `tempfile.mkstemp` is unusable here).
+ *
+ * A successful probe leaves the directory behind, so it is marked ignored right
+ * away: the runtime root normally sits in the user's own repository, and probing
+ * must not be what dirties their `git status` (see `self_ignore` in workbench.py,
+ * which does the same for the directory the service settles on).
+ */
+const probeWritableDir = (dir) => {
+  try {
+    mkdirSync(dir, { recursive: true })
+    const probe = join(dir, '.wb-write-probe-' + process.pid)
+    writeFileSync(probe, '')
+    rmSync(probe, { force: true })
+    if (!existsSync(join(dir, '.gitignore'))) {
+      writeFileSync(join(dir, '.gitignore'), '# Created by html-workbench: disposable logs and cache.\n*\n')
+    }
+    return true
+  } catch (e) {
+    return false
+  }
+}
+
+/**
+ * Choose the runtime directory to ASK the service for.
+ *
+ * The workspace comes first: it is the one tree the sandbox reliably grants and it
+ * keeps the re-downloadable GrapesJS cache across restarts. The historical temp
+ * location stays as a fallback for deployments with no writable cwd.
+ *
+ * This is a request, not a guarantee — the probe runs with the parent's rights,
+ * which are wider than the child's. The service re-probes in-process, falls back
+ * on its own, and reports the directories it really used, so a wrong guess here
+ * costs a different folder, never a failed start.
+ */
+const resolveRuntimeDir = () => {
+  const candidates = [
+    process.cwd() ? join(process.cwd(), RUNTIME_DIR_NAME) : null,
+    join(tmpdir(), RUNTIME_DIR_NAME),
+  ]
+  for (const candidate of candidates) {
+    if (candidate && probeWritableDir(candidate)) return candidate
+  }
+  return candidates[0] || join(tmpdir(), RUNTIME_DIR_NAME)
+}
+
+const runtimeDir = resolveRuntimeDir()
 
 // The body is a `return { ... }` statement; wrap it in a function and call it.
 // eslint-disable-next-line no-new-func

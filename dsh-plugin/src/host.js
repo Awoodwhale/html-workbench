@@ -28,23 +28,30 @@ return {
     const PORT = opts.port || 4317
     const SCRIPT = opts.script || null
     const EDITOR_ROOT = opts.editorRoot || null
-    // Static packages inject Node's platform-aware `tmpdir()` from src/index.js.
-    // Keep a dynamic-loader fallback too: TEMP/TMPDIR cover Windows/macOS/Linux;
-    // only the final fallback is POSIX because dynamic runners may not expose
-    // Node's `os` module. This folder contains only disposable cache/log data.
+    // Static packages inject the runtime directory resolved (and probed) by
+    // src/index.js. Keep a dynamic-loader fallback too: TEMP/TMPDIR cover
+    // Windows/macOS/Linux; only the final fallback is POSIX because dynamic
+    // runners may not expose Node's `os` module. The folder name matches
+    // RUNTIME_DIR_NAME in workbench.py so both halves agree on one location.
     const tempRoot = typeof process !== 'undefined' && process.env
       ? (process.env.TEMP || process.env.TMP || process.env.TMPDIR)
       : null
-    const RUNTIME_DIR = opts.runtimeDir || (tempRoot ? tempRoot.replace(/[\\/]$/, '') + '/html-workbench-dsh' : '/tmp/html-workbench-dsh')
+    const RUNTIME_DIR = opts.runtimeDir || (tempRoot ? tempRoot.replace(/[\\/]$/, '') + '/.html-workbench' : '/tmp/.html-workbench')
 
-    // DSH runs plugin subprocesses under a workspace-write sandbox. `~/.cache`
-    // is deliberately outside that allow-list, so the service used to die before
-    // binding the port while trying to open its rotating log. Keep ALL runtime
-    // writes (service logs + downloaded GrapesJS vendor files) in /tmp instead.
-    // This is a cache by design: it is safe to delete and the service recreates
-    // it on the next start.
+    // These are REQUESTS, not guarantees. The service runs as a DSH sandboxed
+    // child that may write only the session workspace and a private temp folder
+    // the sandbox hands it — the ambient %TEMP% root seen by this parent is
+    // denied, so a folder the parent can create is not necessarily one the child
+    // can use. workbench.py therefore re-probes in-process, falls back on its
+    // own, and advertises the directories it settled on; `adoptResolvedPaths`
+    // below surfaces those, so the panel describes where the service really
+    // writes instead of echoing the path we merely asked for. Both are disposable
+    // cache/log data either way.
     const LOG_DIR = RUNTIME_DIR + '/logs'
     const VENDOR_CACHE = RUNTIME_DIR + '/vendor'
+
+    // Directories the running service reported; null until it says so.
+    let resolvedPaths = null
 
     let assets = []
     let seq = 0
@@ -137,9 +144,23 @@ return {
       }
     }
 
+    // `/api/health` advertises the directories the service really writes to. The
+    // paths it was ASKED for may be exactly what the sandbox refused, so adopting
+    // the reported ones is what lets the panel stay truthful — for a service we
+    // started and for one we merely reused (a reused service leaves us no startup
+    // output to read them from).
+    const adoptResolvedPaths = (payload) => {
+      if (!payload) return
+      const logDir = typeof payload.logDir === 'string' ? payload.logDir : null
+      const vendorCache = typeof payload.vendorCache === 'string' ? payload.vendorCache : null
+      if (logDir || vendorCache) resolvedPaths = { logDir: logDir, vendorCache: vendorCache }
+    }
+
     const health = async () => {
       const probe = await probeHealth()
-      return probe && probe.ok ? probe.payload : null
+      if (!probe || !probe.ok) return null
+      adoptResolvedPaths(probe.payload)
+      return probe.payload
     }
 
     // `workbench.py` reports failures as one structured JSON line on stderr. Turn
@@ -220,6 +241,7 @@ return {
             serviceRunning = true
             startError = null
             healthConfirmedAt = Date.now()
+            adoptResolvedPaths(probe.payload)
             note('info', '本地服务就绪：版本 ' + (probe.payload.version || '未知') + '，端口 ' + PORT)
             return probe.payload
           }
@@ -306,8 +328,12 @@ return {
         script: SCRIPT,
         editorRoot: EDITOR_ROOT,
         runtimeDir: RUNTIME_DIR,
-        logDir: LOG_DIR,
-        vendorCache: VENDOR_CACHE,
+        // Where the service really writes, once it has told us. The requested
+        // paths stand in only until then: they may be exactly what the sandbox
+        // refused, and showing them after the fact is what made a working service
+        // look broken.
+        logDir: (resolvedPaths && resolvedPaths.logDir) || LOG_DIR,
+        vendorCache: (resolvedPaths && resolvedPaths.vendorCache) || VENDOR_CACHE,
         hasShell: !!shell,
         processStatus: ownedProcess ? ownedProcess.status : null,
         exitCode: ownedProcess ? ownedProcess.exitCode : null,

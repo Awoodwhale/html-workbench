@@ -47,6 +47,10 @@ dsh-plugin/
 - Host 采纳上报值（`adoptResolvedPaths`），于是面板显示的是真实路径，而不是它请求过的路径；复用别的进程启动的服务时同样如此；
 - 探测**不允许重试**：Windows 上 `tempfile.mkstemp` 遇到 `PermissionError` 会用只看 DACL 的 `os.access` 复检、再换随机名重试 10 000 次，会把"1 秒报错"变成"卡住数分钟并烧 CPU"。故改用 `make_temp_file()` 的单次 `O_EXCL` 打开。
 
+日志目录**全部候选都不可写**时，服务挂 `NullHandler` 照常启动：丢一份诊断日志可以接受，端口不 bind 不可以。
+
+工作区通常就是**用户自己的仓库**，所以建出目录的那一半会在运行时根写入内容为 `*` 的 `.gitignore`（`self_ignore()` / `probeWritableDir()`），让整棵树连同该文件一起对 git 隐形——本仓库的 `.gitignore` 只管得住自己的 checkout。判定依据是 `RUNTIME_DIR_NAME` 而非传入目录，否则 `--log-dir .` 会把用户的源码树整个变成被忽略的。
+
 ## RPC 接口（Client → Host）
 
 | method   | 入参        | 返回                                   |

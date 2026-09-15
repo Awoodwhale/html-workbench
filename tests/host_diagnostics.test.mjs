@@ -349,3 +349,288 @@ test('the host marks the runtime directory it probes as git-ignored', async () =
     process.chdir(previous)
   }
 })
+test('Windows falls back from python3 to python for every CLI call', async () => {
+  const commands = []
+  const shell = {
+    resolve: (spec) => (commands.push(spec.command), spec),
+    run: async (spec) => {
+      if (spec.command === 'python3 --version') return { exitCode: 1, stdout: collected(''), stderr: collected('not found') }
+      if (spec.command === 'python --version') return { exitCode: 0, stdout: collected('Python 3.12.0'), stderr: collected('') }
+      if (spec.command.includes(' health ')) {
+        return { exitCode: 0, stdout: collected(JSON.stringify({ ok: true, service: 'html-workbench', version: '2.1.0' })), stderr: collected('') }
+      }
+      if (spec.command.includes(' -c ')) return { exitCode: 0, stdout: collected(''), stderr: collected('') }
+      return { exitCode: 1, stdout: collected(''), stderr: collected('unexpected command') }
+    },
+    start: () => { throw new Error('healthy service must be reused') },
+  }
+  const ctx = await boot(shell, { port: 4913, platform: 'win32', runtimeDir: 'C:/Temp/html-workbench-dsh' })
+  const resolved = await callRoute(ctx, '/html-workbench/resolve?file=C%3A%2Ftmp%2Fpage.html')
+  const diag = await callRoute(ctx, '/html-workbench/diagnostics')
+
+  assert.equal(resolved.exists, true)
+  assert.equal(diag.pythonCommand, 'python')
+  assert.equal(diag.runtimeDir, 'C:/Temp/html-workbench-dsh')
+  assert.ok(commands.includes('python3 --version'))
+  assert.ok(commands.includes('python --version'))
+  assert.ok(commands.some((command) => command.startsWith('python "/tmp/fake/workbench.py" health ')))
+  assert.ok(commands.some((command) => command.startsWith('python -c ')))
+  assert.ok(!commands.some((command) => command.startsWith('py -3 ')), 'stop probing after the first working interpreter')
+})
+
+// ── Command-line quoting ────────────────────────────────────────────────────
+//
+// These pin the bug class that survives an interpreter fix: the path reaches the
+// subprocess CORRUPTED, so a correct path is reported as missing and the user is
+// told their file does not exist.
+
+test('a Windows path with spaces stays intact through the existence probe', async () => {
+  const commands = []
+  const shell = {
+    resolve: (spec) => (commands.push(spec.command), spec),
+    run: async (spec) => {
+      if (spec.command === 'python3 --version') return { exitCode: 0, stdout: collected('Python 3.12.0'), stderr: collected('') }
+      if (spec.command.includes(' health ')) {
+        return { exitCode: 0, stdout: collected(JSON.stringify({ ok: true, service: 'html-workbench', version: '2.1.0' })), stderr: collected('') }
+      }
+      return { exitCode: 0, stdout: collected(''), stderr: collected('') }
+    },
+    start: () => { throw new Error('healthy service must be reused') },
+  }
+  const ctx = await boot(shell, { port: 4914, platform: 'win32', runtimeDir: 'C:/Temp/hwb' })
+  const target = 'C:\\Users\\Zhou Hongxuan\\Desktop\\page.html'
+  await callRoute(ctx, '/html-workbench/resolve?file=' + encodeURIComponent(target))
+
+  const probe = commands.find((command) => command.includes(' -c '))
+  assert.ok(probe, 'the existence probe must run')
+  // The old code used JSON.stringify, which emits `\\` — cmd.exe forwards those
+  // literally and Python then looks for a path that cannot exist.
+  assert.ok(!probe.includes('\\\\'), 'JSON escaping must not reach the command line')
+  assert.ok(probe.includes('"' + target + '"'), 'the path must arrive verbatim, quoted for spaces')
+})
+
+test('a trailing backslash cannot escape its own closing quote', async () => {
+  const commands = []
+  const shell = {
+    resolve: (spec) => (commands.push(spec.command), spec),
+    run: async (spec) => (spec.command.endsWith('--version')
+      ? { exitCode: 0, stdout: collected('Python 3.12.0'), stderr: collected('') }
+      : { exitCode: 1, stdout: collected(''), stderr: collected('') }),
+    start: () => ({ status: 'running', exitCode: null, signal: null, readOutput: () => ({ delta: '' }), kill: () => true }),
+  }
+  // `%TEMP%` values legitimately end in a separator; `"C:\dir\"` would escape the
+  // quote and merge the next argument into the path.
+  const ctx = await boot(shell, { port: 4915, platform: 'win32', runtimeDir: 'C:\\Temp\\hwb\\' })
+  await callRoute(ctx, '/html-workbench/diagnostics')
+
+  const serve = commands.find((command) => command.includes(' serve '))
+  assert.ok(serve, 'serve must be attempted')
+  // One quoted token: the separator is normalised away, so nothing turns into
+  // `C:\Temp\hwb\/logs`, and no backslash is left escaping the closing quote.
+  assert.ok(serve.includes('--log-dir "C:\\Temp\\hwb/logs"'), 'a quoted path must stay one argument')
+  assert.ok(!serve.includes('\\/'), 'a trailing separator must not survive concatenation')
+  assert.ok(!/[^\\]\\"/.test(serve), 'no closing quote may be left escaped by a backslash')
+})
+
+test('a POSIX path with a quote is escaped, not injected', async () => {
+  const commands = []
+  const shell = {
+    resolve: (spec) => (commands.push(spec.command), spec),
+    run: async (spec) => (spec.command.includes(' health ')
+      ? { exitCode: 0, stdout: collected(JSON.stringify({ ok: true, service: 'html-workbench', version: '2.1.0' })), stderr: collected('') }
+      : { exitCode: 0, stdout: collected(''), stderr: collected('') }),
+    start: () => { throw new Error('healthy service must be reused') },
+  }
+  const ctx = await boot(shell, { port: 4916 })
+  await callRoute(ctx, '/html-workbench/resolve?file=' + encodeURIComponent("/tmp/it's here/page.html"))
+
+  const probe = commands.find((command) => command.includes(' -c '))
+  assert.ok(probe.includes("'/tmp/it'\\''s here/page.html'"), 'a single quote must be neutralised')
+})
+
+// ── Interpreter probe caching ────────────────────────────────────────────────
+
+test('a failed interpreter probe is cached instead of retried per keystroke', quiet(async () => {
+  let versionProbes = 0
+  const shell = {
+    resolve: (spec) => spec,
+    run: async (spec) => {
+      if (spec.command.endsWith('--version')) versionProbes += 1
+      return { exitCode: 1, stdout: collected(''), stderr: collected('command not found') }
+    },
+    start: () => { throw new Error('must not spawn without an interpreter') },
+  }
+  const ctx = await boot(shell, { port: 4917, platform: 'win32', runtimeDir: 'C:/Temp/hwb' })
+  const afterBoot = versionProbes
+
+  // Five keystrokes in the address bar. Each used to re-probe every candidate at
+  // 5s timeout apiece, and each failure overwrote the journal.
+  for (let i = 0; i < 5; i += 1) {
+    await callRoute(ctx, '/html-workbench/resolve?file=%2Ftmp%2Fpage' + i + '.html')
+  }
+
+  assert.equal(versionProbes, afterBoot, 'a known-failed probe must not respawn subprocesses')
+  const diag = await callRoute(ctx, '/html-workbench/diagnostics')
+  assert.match(diag.startError, /找不到可用的 Python 3 解释器/)
+  assert.match(diag.startError, /重启服务/, 'the message must say how to recover')
+  const misses = diag.journal.filter((entry) => /找不到可用的 Python/.test(entry.message))
+  assert.equal(misses.length, 1, 'the journal must not be flooded by one repeated cause')
+}))
+
+test('the probe is retried once the cache window expires', quiet(async () => {
+  let pythonInstalled = false
+  let versionProbes = 0
+  const shell = {
+    resolve: (spec) => spec,
+    run: async (spec) => {
+      if (spec.command.endsWith('--version')) {
+        versionProbes += 1
+        return pythonInstalled
+          ? { exitCode: 0, stdout: collected('Python 3.12.0'), stderr: collected('') }
+          : { exitCode: 1, stdout: collected(''), stderr: collected('not found') }
+      }
+      return { exitCode: 1, stdout: collected(''), stderr: collected('') }
+    },
+    start: () => ({ status: 'running', exitCode: null, signal: null, readOutput: () => ({ delta: '' }), kill: () => true }),
+  }
+  const ctx = await boot(shell, { port: 4918, platform: 'win32', runtimeDir: 'C:/Temp/hwb' })
+  const afterBoot = versionProbes
+
+  // The user installs Python. Without a TTL they would have to reload DSH.
+  pythonInstalled = true
+  const realNow = Date.now
+  Date.now = () => realNow() + 31000
+  try {
+    await callRoute(ctx, '/html-workbench/resolve?file=%2Ftmp%2Fpage.html')
+  } finally {
+    Date.now = realNow
+  }
+
+  assert.ok(versionProbes > afterBoot, 'the window must expire so recovery needs no reload')
+  const diag = await callRoute(ctx, '/html-workbench/diagnostics')
+  assert.equal(diag.pythonCommand, 'python3')
+}))
+
+test('a missing interpreter is reported on the resolve route, not silently dropped', quiet(async () => {
+  const shell = {
+    resolve: (spec) => spec,
+    run: async () => ({ exitCode: 1, stdout: collected(''), stderr: collected('command not found') }),
+    start: () => { throw new Error('must not spawn without an interpreter') },
+  }
+  const ctx = await boot(shell, { port: 4919, platform: 'win32', runtimeDir: 'C:/Temp/hwb' })
+  const resolved = await callRoute(ctx, '/html-workbench/resolve?file=%2Ftmp%2Fpage.html')
+
+  assert.equal(resolved.exists, null, 'the check genuinely could not run')
+  // `exists: null` alone renders as no indicator at all — the field looks broken.
+  assert.match(resolved.error, /找不到可用的 Python 3 解释器/)
+}))
+
+test('the py launcher is expanded to an absolute path, never used as a prefix', async () => {
+  const commands = []
+  const executable = 'C:\\Users\\Zhou Hongxuan\\AppData\\Local\\Programs\\Python\\Python312\\python.exe'
+  const shell = {
+    resolve: (spec) => (commands.push(spec.command), spec),
+    run: async (spec) => {
+      if (spec.command.endsWith('--version')) return { exitCode: 1, stdout: collected(''), stderr: collected('not found') }
+      if (spec.command.startsWith('py -3 -c ')) return { exitCode: 0, stdout: collected(executable + '\n'), stderr: collected('') }
+      if (spec.command.includes(' health ')) {
+        return { exitCode: 0, stdout: collected(JSON.stringify({ ok: true, service: 'html-workbench', version: '2.1.0' })), stderr: collected('') }
+      }
+      return { exitCode: 0, stdout: collected(''), stderr: collected('') }
+    },
+    start: () => { throw new Error('healthy service must be reused') },
+  }
+  const ctx = await boot(shell, { port: 4920, platform: 'win32', runtimeDir: 'C:/Temp/hwb' })
+  const diag = await callRoute(ctx, '/html-workbench/diagnostics')
+
+  assert.equal(diag.pythonCommand, '"' + executable + '"')
+  // `py -3 script.py` mangles forwarded arguments, so the launcher may only ever
+  // appear in the one probe that asks it for sys.executable.
+  const launcherUses = commands.filter((command) => command.startsWith('py '))
+  assert.equal(launcherUses.length, 1, 'the launcher is a lookup, not a command prefix')
+  assert.ok(commands.some((command) => command.startsWith('"' + executable + '" ')), 'the resolved interpreter runs the script')
+})
+
+
+// ── Failure containment ─────────────────────────────────────────────────────
+
+test('a throwing handler answers with the reason instead of hanging the request', quiet(async () => {
+  const ctx = await boot(healthyShell(), { port: 4921 })
+  // Force the failure the guard exists for: a route whose body blows up. The
+  // browser sees an unanswered socket as `TypeError: Failed to fetch`, which is
+  // exactly the unactionable string this plugin used to hand its users.
+  const handler = ctx.routes.get('/html-workbench/open')
+  let status = null
+  let body = null
+  await handler({ url: '/html-workbench/open' }, {
+    writeHead(code) { status = code },
+    end(payload) { body = JSON.parse(payload) },
+  })
+  assert.equal(status, 400, 'a missing file is a normal, answered rejection')
+  assert.ok(body && body.error, 'the reason must be in the body')
+
+  const poisoned = ctx.routes.get('/html-workbench/list')
+  let guarded = null
+  let guardedStatus = null
+  let first = true
+  await poisoned({ url: '/html-workbench/list' }, {
+    writeHead(code) {
+      if (first) { first = false; throw new Error('boom inside the handler') }
+      guardedStatus = code
+    },
+    end(payload) { guarded = JSON.parse(payload) },
+  })
+  assert.equal(guardedStatus, 500, 'the guard must still write a response')
+  assert.match(guarded.error, /插件内部错误（list）/)
+  assert.match(guarded.detail, /boom inside the handler/)
+  assert.ok(guarded.diagnostics, 'the journal must ride along for the report')
+}))
+
+test('the diagnostics route is registered before anything that can fail', async () => {
+  const order = []
+  const shell = healthyShell()
+  const ctx = makeContext(shell)
+  const originalRegister = ctx.get('webServer').register
+  ctx.get('webServer').register = (spec) => (order.push(spec.path), originalRegister(spec))
+  loadPlugin().apply(ctx, { script: '/tmp/fake/workbench.py', port: 4922 })
+  await new Promise((done) => setTimeout(done, 150))
+
+  assert.equal(order[0], '/html-workbench/diagnostics',
+    'the one route that explains a broken plugin must not depend on the rest registering')
+})
+
+test('repeated info lines cannot evict the error that explains the failure', quiet(async () => {
+  const ctx = await boot(dyingShell('ModuleNotFoundError: No module named \'ssl\''), { port: 4923 })
+  // `restart` journals on every call, and a user staring at a red dot clicks it
+  // repeatedly. A plain 40-entry ring buffer would push the original traceback
+  // out long before they think to read the panel.
+  for (let i = 0; i < 60; i += 1) await callRoute(ctx, '/html-workbench/restart')
+  const diag = await callRoute(ctx, '/html-workbench/diagnostics')
+
+  const detail = diag.journal.map((entry) => entry.detail || '').join('\n')
+  assert.ok(detail.includes("No module named 'ssl'"), 'the root cause must survive the noise')
+  assert.ok(diag.journal.length <= 40, 'the buffer still has a hard ceiling')
+}))
+
+test('the diagnostics name the build that produced them', async () => {
+  const ctx = await boot(healthyShell(), { port: 4924, version: '0.3.0', platform: 'win32', runtimeDir: 'C:/Temp/hwb' })
+  const diag = await callRoute(ctx, '/html-workbench/diagnostics')
+
+  // Without these two fields every bug report needs a follow-up question.
+  assert.equal(diag.version, '0.3.0')
+  assert.equal(diag.platform, 'win32')
+})
+
+test('distinct noise cannot evict the startup error either', quiet(async () => {
+  const ctx = await boot(dyingShell('ModuleNotFoundError: No module named \'ssl\''), { port: 4925 })
+  // Coalescing only folds IDENTICAL lines. Typing in the path box produces one
+  // distinct failure per path, which is enough to fill the buffer with lines
+  // that are individually useless and evict the one that explains everything.
+  for (let i = 0; i < 60; i += 1) {
+    await callRoute(ctx, '/html-workbench/resolve?file=%2Ftmp%2Fpage' + i + '.html')
+  }
+  const diag = await callRoute(ctx, '/html-workbench/diagnostics')
+
+  const detail = diag.journal.map((entry) => entry.detail || '').join('\n')
+  assert.ok(detail.includes("No module named 'ssl'"), 'the startup error must outlive per-keystroke noise')
+}))

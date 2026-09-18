@@ -7,13 +7,20 @@
  * `window.__ModuleLoader__.load(...)` at build time.
  *
  * Responsibilities (runs in the browser):
- *  - Register a right-side panel + corner trigger in `shell.overlay`.
+ *  - Put the panel wherever the profile can carry it. When dsh-better-sidebar
+ *    is active the panel becomes one of its tab types and fills that tab's
+ *    body inside the column the sidebar owns (DSH's native right Sidebar on
+ *    0.1.5-rc.1+); otherwise it is the plugin's own floating panel plus corner
+ *    trigger in `shell.overlay`. The sidebar takes over the whole right
+ *    column, so contributing a tab is the only way to live there — a second
+ *    floating panel would cover it.
  *  - Layout is browser-like: a two-row chrome at the TOP (identity row +
  *    address/toolbar row) and the preview filling everything below. Nothing
  *    sits at the bottom, so the panel never visually competes with the chat
  *    composer on the left.
  *  - Open a file by calling Host `open`, then embed the workbench URL in an
- *    iframe. Left edge is draggable to resize the panel width (persisted).
+ *    iframe. The floating panel's left edge is draggable to resize its width
+ *    (persisted); the tabbed panel follows the column's own width.
  *
  * Styling contract: every colour/shadow comes from the host's `--dsw-alias-*`
  * design tokens (see the DSH first-party plugins) so light/dark themes and
@@ -25,7 +32,6 @@ return {
   inject: ['timer'],
   apply(ctx) {
     const slots = ctx.get('slots')
-    if (slots === undefined) return
 
     // ── Styles ───────────────────────────────────────────────────────────────
     // NOTE: both style shims (dynamic runner + static bundle) de-duplicate by a
@@ -35,23 +41,11 @@ return {
     // positioned chevron collapsing into a block below the input). So manage the
     // <style> element here: drop every previous generation, then insert fresh.
     const STYLE_MARK = 'data-hwb-styles'
-    const STYLE_VERSION = '5'
+    const STYLE_VERSION = '6'
 
+    // Chrome both seats share.
     const CSS = `
-html #root {
-  margin-right: calc(var(--dsh-sidebar-width, 0px) + var(--hwb-panel-width, 0px));
-  transition: margin-right var(--ds-transition-duration-slow, 200ms) var(--ds-ease-in-out, ease);
-}
-body[data-hwb-dragging] #root { transition: none; }
 body[data-hwb-dragging] { user-select: none; cursor: col-resize; }
-
-/* Reserve right-side clearance in the session header so the corner trigger
-   never overlaps its right-aligned utilities (e.g. "Session log"). The
-   clearance relaxes as the panel opens, because the trigger then hides. */
-header:has([data-slot="conversation.session.header.utilities"]) {
-  padding-right: max(28px, calc(60px - var(--hwb-panel-width, 0px)));
-  transition: padding-right var(--ds-transition-duration-slow, 200ms) var(--ds-ease-in-out, ease);
-}
 
 .hwb-panel, .hwb-panel * { box-sizing: border-box; }
 .hwb-panel {
@@ -67,11 +61,13 @@ header:has([data-slot="conversation.session.header.utilities"]) {
   --hwb-mono: var(--dsh-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
 }
 
-/* Resize handle — a wide invisible hit area with a thin visible rail. */
-.hwb-resize { position: absolute; left: -4px; top: 0; bottom: 0; width: 9px; z-index: 5; cursor: col-resize; touch-action: none; border: none; padding: 0; background: transparent; }
-.hwb-resize::after { content: ""; position: absolute; left: 4px; top: 0; bottom: 0; width: 2px; border-radius: 2px; background: transparent; transition: background 150ms ease; }
-.hwb-resize:hover::after, .hwb-resize:focus-visible::after, .hwb-resize[data-active]::after { background: var(--dsw-alias-interactive-bg-hover-accent); }
-.hwb-resize:focus-visible { outline: none; }
+/* Sidebar seat: the tab body already is a full-height flex column, so the
+   panel drops the floating seat's geometry — no fixed seat, no width of its
+   own, no seam against the chat column — and fills what it was handed. */
+.hwb-panel[data-seat="sidebar"] {
+  position: static; inset: auto; flex: 1 1 auto; height: 100%; min-height: 0;
+  border-left: none; box-shadow: none; z-index: auto;
+}
 
 /* ── Chrome: identity row + toolbar row ───────────────────────────────────── */
 .hwb-chrome { flex: none; display: flex; flex-direction: column; background: var(--dsw-alias-bg-layer-1); border-bottom: 1px solid var(--dsw-alias-border-l2); }
@@ -209,7 +205,42 @@ header:has([data-slot="conversation.session.header.utilities"]) {
 .hwb-recent-label { padding: 0 8px 2px; color: var(--dsw-alias-label-tertiary); font-size: 11px; }
 .hwb-spinner { width: 22px; height: 22px; border-radius: 50%; border: 2px solid var(--dsw-alias-border-l1); border-top-color: var(--dsw-alias-state-business-primary, #4d6bfe); animation: hwb-spin 700ms linear infinite; }
 
-/* ── Corner trigger ───────────────────────────────────────────────────────── */
+@keyframes hwb-spin { to { transform: rotate(360deg); } }
+@keyframes hwb-pop { from { opacity: 0; transform: translateY(-4px); } }
+@media (prefers-reduced-motion: reduce) {
+  .hwb-menu { animation: none; }
+}
+`
+
+    // Everything the floating seat owns and the sidebar seat must not have: the
+    // width a floating panel takes out of `#root`, the room its corner trigger
+    // needs in the session header, and the chrome those two elements wear. Under
+    // the sidebar seat the column's width, the trigger's job and the frame around
+    // the panel all belong to that plugin, so this sheet stays out of the
+    // document entirely.
+    const OVERLAY_CSS = `
+html #root {
+  margin-right: calc(var(--dsh-sidebar-width, 0px) + var(--hwb-panel-width, 0px));
+  transition: margin-right var(--ds-transition-duration-slow, 200ms) var(--ds-ease-in-out, ease);
+}
+body[data-hwb-dragging] #root { transition: none; }
+
+/* Reserve right-side clearance in the session header so the corner trigger
+   never overlaps its right-aligned utilities (e.g. "Session log"). The
+   clearance relaxes as the panel opens, because the trigger then hides. */
+header:has([data-slot="conversation.session.header.utilities"]) {
+  padding-right: max(28px, calc(60px - var(--hwb-panel-width, 0px)));
+  transition: padding-right var(--ds-transition-duration-slow, 200ms) var(--ds-ease-in-out, ease);
+}
+
+/* Resize handle — a wide invisible hit area with a thin visible rail. */
+.hwb-resize { position: absolute; left: -4px; top: 0; bottom: 0; width: 9px; z-index: 5; cursor: col-resize; touch-action: none; border: none; padding: 0; background: transparent; }
+.hwb-resize::after { content: ""; position: absolute; left: 4px; top: 0; bottom: 0; width: 2px; border-radius: 2px; background: transparent; transition: background 150ms ease; }
+.hwb-resize:hover::after, .hwb-resize:focus-visible::after, .hwb-resize[data-active]::after { background: var(--dsw-alias-interactive-bg-hover-accent); }
+.hwb-resize:focus-visible { outline: none; }
+
+/* Corner trigger — the floating seat's entry point, sitting just clear of the
+   panel's left edge (and of the session header's own utilities). */
 .hwb-trigger {
   position: fixed; top: 8px;
   right: calc(var(--dsh-sidebar-width, 0px) + var(--hwb-panel-width, 0px) + 12px);
@@ -221,30 +252,10 @@ header:has([data-slot="conversation.session.header.utilities"]) {
 .hwb-trigger:hover { background: var(--dsw-alias-interactive-bg-hover); color: var(--dsw-alias-label-primary); }
 .hwb-trigger:focus-visible { outline: 2px solid var(--dsw-alias-state-business-primary, #4d6bfe); outline-offset: 1px; }
 
-@keyframes hwb-spin { to { transform: rotate(360deg); } }
-@keyframes hwb-pop { from { opacity: 0; transform: translateY(-4px); } }
 @media (prefers-reduced-motion: reduce) {
-  html #root, .hwb-trigger, header:has([data-slot="conversation.session.header.utilities"]) { transition: none; }
-  .hwb-menu { animation: none; }
+  html #root, header:has([data-slot="conversation.session.header.utilities"]), .hwb-trigger { transition: none; }
 }
 `
-
-    const applyStyles = () => {
-      if (typeof document === 'undefined') { try { styles.insert(CSS) } catch (e) {} return () => {} }
-      const stale = document.querySelectorAll('style[' + STYLE_MARK + '], style#html-workbench-dsh-plugin-styles')
-      for (let i = 0; i < stale.length; i += 1) {
-        const node = stale[i]
-        if (node.parentNode) node.parentNode.removeChild(node)
-      }
-      const el = document.createElement('style')
-      el.setAttribute(STYLE_MARK, STYLE_VERSION)
-      el.textContent = CSS
-      document.head.appendChild(el)
-      return () => { if (el.parentNode) el.parentNode.removeChild(el) }
-    }
-
-    if (typeof ctx.effect === 'function') ctx.effect(applyStyles, 'html-workbench: styles')
-    else applyStyles()
 
     // ── Store ────────────────────────────────────────────────────────────────
     const DEFAULT_WIDTH = 820
@@ -263,6 +274,10 @@ header:has([data-slot="conversation.session.header.utilities"]) {
     let resolveTimer = null
 
     const store = {
+      // Which seat the panel is in: the plugin's own floating overlay, or the
+      // tab dsh-better-sidebar hosts. Both seats and the stylesheet read this,
+      // and `setSeat` is the only writer.
+      seat: 'overlay',
       open: false,
       panelWidth: readWidth(),
       assets: [],
@@ -298,6 +313,39 @@ header:has([data-slot="conversation.session.header.utilities"]) {
       const [, force] = React.useState(0)
       React.useEffect(() => store.subscribe(() => force((x) => x + 1)), [])
       return store
+    }
+
+    // Only the floating seat reserves width in `#root` and needs the session
+    // header to keep clear of its corner trigger, so the sheet swaps with the
+    // seat instead of carrying rules the sidebar seat would have to fight.
+    let styleEl = null
+    const applyStyles = () => {
+      const sheet = store.seat === 'overlay' ? CSS + OVERLAY_CSS : CSS
+      if (typeof document === 'undefined') { try { styles.insert(sheet) } catch (e) {} return }
+      const stale = document.querySelectorAll('style[' + STYLE_MARK + '], style#html-workbench-dsh-plugin-styles')
+      for (let i = 0; i < stale.length; i += 1) {
+        const node = stale[i]
+        if (node.parentNode) node.parentNode.removeChild(node)
+      }
+      styleEl = document.createElement('style')
+      styleEl.setAttribute(STYLE_MARK, STYLE_VERSION)
+      styleEl.textContent = sheet
+      document.head.appendChild(styleEl)
+    }
+
+    const setSeat = (next) => {
+      if (store.seat === next) return
+      store.set({ seat: next })
+      applyStyles()
+    }
+
+    if (typeof ctx.effect === 'function') {
+      ctx.effect(() => {
+        applyStyles()
+        return () => { if (styleEl && styleEl.parentNode) styleEl.parentNode.removeChild(styleEl); styleEl = null }
+      }, 'html-workbench: styles')
+    } else {
+      applyStyles()
     }
 
     const basename = (p) => {
@@ -608,6 +656,17 @@ header:has([data-slot="conversation.session.header.utilities"]) {
 
     bindSendInterception()
 
+    // The workbench runs in an iframe, so its selections arrive as messages
+    // whenever one is open — in either seat, and independently of which file the
+    // panel happens to be showing. Bound with the plugin, not with the panel.
+    const onWorkbenchMessage = (event) => {
+      const data = event.data
+      if (!data || data.type !== 'html-workbench:context') return
+      if (!data.markdown) return
+      receiveContext(data)
+    }
+    window.addEventListener('message', onWorkbenchMessage)
+    ctx.effect(() => () => window.removeEventListener('message', onWorkbenchMessage))
 
     const checkPath = (value) => {
       const trimmed = (value || '').trim()
@@ -653,12 +712,15 @@ header:has([data-slot="conversation.session.header.utilities"]) {
     const I_FILE = icon(14, [path('M14 3v5h5', 'a'), path('M15 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7Z', 'b')])
     const I_ALERT = icon(14, [React.createElement('circle', { cx: 12, cy: 12, r: 9, key: 'a' }), path('M12 8v4', 'b'), path('M12 16h.01', 'c')])
     const I_BLANK = icon(22, [path('M14 3v5h5', 'a'), path('M15 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7Z', 'b'), path('m9 15 1.8-2.2L12.4 15l1.4-1.8', 'c')])
-    const I_TRIGGER = icon(17, [
+    // One drawing serves both seats: the floating panel's corner trigger and the
+    // tab chip the sidebar renders from the descriptor's `icon`.
+    const triggerGlyph = (size) => icon(size, [
       React.createElement('rect', { x: 2.5, y: 4, width: 19, height: 14, rx: 2.4, key: 'a' }),
       path('M2.5 8.4h19', 'b'),
       path('M8 21h8', 'c'),
       path('M12 18v3', 'd'),
     ])
+    const I_TRIGGER = triggerGlyph(17)
     const I_LOGS = icon(15, [path('M8 6h10', 'a'), path('M8 12h10', 'b'), path('M8 18h6', 'c'), path('M4 6h.01', 'd'), path('M4 12h.01', 'e'), path('M4 18h.01', 'f')])
 
     // ── Diagnostics view ─────────────────────────────────────────────────────
@@ -818,38 +880,40 @@ header:has([data-slot="conversation.session.header.utilities"]) {
     }
 
     // ── Panel ────────────────────────────────────────────────────────────────
-    const Panel = () => {
+    //
+    // One component for both seats. `placement` names the seat it was mounted
+    // into and the store says which seat is live, so a handed-over seat renders
+    // nothing. Only the floating seat carries the resize handle and the close
+    // button — the sidebar owns that tab's width and its closing.
+    const Panel = ({ placement, visible }) => {
       const s = useStore()
+      const overlay = placement === 'overlay'
+      // The floating seat draws only while it is the live one and open; the
+      // sidebar's body exists exactly as long as its tab does, so it always
+      // draws and only pauses what it polls.
+      const live = overlay ? s.seat === 'overlay' && s.open : true
       const [menuOpen, setMenuOpen] = React.useState(false)
       const [focused, setFocused] = React.useState(false)
       const fieldRef = React.useRef(null)
       const inputRef = React.useRef(null)
 
       React.useEffect(() => {
+        if (!overlay) return undefined
         const root = document.documentElement
-        root.style.setProperty('--hwb-panel-width', s.open ? s.panelWidth + 'px' : '0px')
+        root.style.setProperty('--hwb-panel-width', live ? s.panelWidth + 'px' : '0px')
         return () => { root.style.setProperty('--hwb-panel-width', '0px') }
-      }, [s.open, s.panelWidth])
+      }, [overlay, live, s.panelWidth])
 
+      // Poll while the panel is on screen: the floating one while it is open,
+      // the tabbed one while its tab is the active one. A backgrounded tab keeps
+      // rendering on purpose — its iframe holds whatever the user was editing.
+      const polling = overlay ? live : visible !== false
       React.useEffect(() => {
-        if (!s.open) return undefined
+        if (!polling) return undefined
         refresh()
         const dispose = ctx.interval(refresh, 4000)
         return () => { if (dispose) dispose() }
-      }, [s.open])
-
-      // The workbench runs in an iframe, so its selections arrive as messages.
-      // Bind while the panel is mounted, regardless of which file is open.
-      React.useEffect(() => {
-        const onMessage = (event) => {
-          const data = event.data
-          if (!data || data.type !== 'html-workbench:context') return
-          if (!data.markdown) return
-          receiveContext(data)
-        }
-        window.addEventListener('message', onMessage)
-        return () => window.removeEventListener('message', onMessage)
-      }, [])
+      }, [polling])
 
       // Drop any in-flight path check when the panel closes.
       React.useEffect(() => () => { if (resolveTimer) { clearTimeout(resolveTimer); resolveTimer = null } }, [])
@@ -863,7 +927,7 @@ header:has([data-slot="conversation.session.header.utilities"]) {
         return () => { document.removeEventListener('mousedown', onDown); document.removeEventListener('keydown', onKey) }
       }, [menuOpen])
 
-      if (!s.open) return null
+      if (!live) return null
 
       const assets = s.assets || []
       const trimmed = (s.pathInput || '').trim()
@@ -939,24 +1003,27 @@ header:has([data-slot="conversation.session.header.utilities"]) {
 
       return React.createElement('div', {
         className: 'hwb-panel',
-        style: { width: s.panelWidth + 'px', maxWidth: 'calc(100vw - 24px)' },
+        'data-seat': overlay ? 'overlay' : 'sidebar',
+        style: overlay ? { width: s.panelWidth + 'px', maxWidth: 'calc(100vw - 24px)' } : undefined,
         role: 'complementary',
         'aria-label': 'HTML Workbench',
       },
-        React.createElement('div', {
-          className: 'hwb-resize',
-          role: 'separator',
-          'aria-orientation': 'vertical',
-          'aria-label': '调整面板宽度',
-          tabIndex: 0,
-          title: '拖动调整宽度（双击复位）',
-          onMouseDown: startResize,
-          onDoubleClick: () => { store.set({ panelWidth: DEFAULT_WIDTH }); writeWidth(DEFAULT_WIDTH) },
-          onKeyDown: (e) => {
-            if (e.key === 'ArrowLeft') { e.preventDefault(); nudgeWidth(32) }
-            else if (e.key === 'ArrowRight') { e.preventDefault(); nudgeWidth(-32) }
-          },
-        }),
+        overlay
+          ? React.createElement('div', {
+            className: 'hwb-resize',
+            role: 'separator',
+            'aria-orientation': 'vertical',
+            'aria-label': '调整面板宽度',
+            tabIndex: 0,
+            title: '拖动调整宽度（双击复位）',
+            onMouseDown: startResize,
+            onDoubleClick: () => { store.set({ panelWidth: DEFAULT_WIDTH }); writeWidth(DEFAULT_WIDTH) },
+            onKeyDown: (e) => {
+              if (e.key === 'ArrowLeft') { e.preventDefault(); nudgeWidth(32) }
+              else if (e.key === 'ArrowRight') { e.preventDefault(); nudgeWidth(-32) }
+            },
+          })
+          : null,
 
         React.createElement('div', { className: 'hwb-chrome' },
           React.createElement('div', { className: 'hwb-idrow' },
@@ -995,10 +1062,13 @@ header:has([data-slot="conversation.session.header.utilities"]) {
                 'aria-label': '在浏览器标签页中打开', disabled: !(s.current && s.current.url),
                 onClick: () => { if (s.current && s.current.url) window.open(s.current.url, '_blank', 'noopener') },
               }, I_EXTERNAL),
-              React.createElement('button', {
-                type: 'button', className: 'hwb-icon', title: '关闭面板',
-                'aria-label': '关闭面板', onClick: () => store.set({ open: false }),
-              }, I_CLOSE),
+              // The tabbed panel is closed from the sidebar's own tab strip.
+              overlay
+                ? React.createElement('button', {
+                  type: 'button', className: 'hwb-icon', title: '关闭面板',
+                  'aria-label': '关闭面板', onClick: () => store.set({ open: false }),
+                }, I_CLOSE)
+                : null,
             ),
           ),
 
@@ -1080,7 +1150,7 @@ header:has([data-slot="conversation.session.header.utilities"]) {
 
     const Trigger = () => {
       const s = useStore()
-      if (s.open) return null
+      if (s.seat !== 'overlay' || s.open) return null
       return React.createElement('button', {
         type: 'button',
         className: 'hwb-trigger',
@@ -1091,9 +1161,41 @@ header:has([data-slot="conversation.session.header.utilities"]) {
       }, I_TRIGGER)
     }
 
+    // ── Seat registration ────────────────────────────────────────────────────
+    //
+    // dsh-better-sidebar turns the right column into DSH's native Sidebar and
+    // renders every registered tab type there, so contributing one is the way a
+    // plugin lives on that column. While that tab is up the panel draws nothing
+    // of its own — no floating seat, no corner trigger, no clearance in `#root`
+    // — because the sidebar owns the column's width and its chrome.
+    //
+    // Which seat is live cannot be settled while this half applies: client
+    // bundles activate in the order their loads finish, so the sidebar's service
+    // often arrives afterwards. `ctx.inject` waits for it, and its fiber is
+    // unloaded if the service ever goes away, which hands the panel back to the
+    // floating seat — both seats stay registered and the store decides.
+    ctx.inject(['betterSidebar'], (sidebarCtx) => {
+      sidebarCtx.effect(() => sidebarCtx.betterSidebar.registerTab({
+        id: 'html-workbench',
+        title: 'HTML Workbench',
+        description: '可视化预览与编辑 agent 生成的 HTML',
+        icon: triggerGlyph,
+        order: 60,
+        single: true,
+        component: (props) => React.createElement(Panel, {
+          placement: 'sidebar',
+          visible: props.visible,
+        }),
+      }), 'html-workbench: sidebar tab')
+      setSeat('sidebar')
+      sidebarCtx.effect(() => () => setSeat('overlay'), 'html-workbench: floating seat')
+    })
+
+    if (slots === undefined) return
+
     slots.inject('shell.overlay', () => slots.register(
       { name: 'shell.overlay', id: 'html-workbench-panel', order: 60, label: 'HTML Workbench' },
-      () => React.createElement(Panel),
+      () => React.createElement(Panel, { placement: 'overlay' }),
     ))
 
     slots.inject('shell.overlay', () => slots.register(

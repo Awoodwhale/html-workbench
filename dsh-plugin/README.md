@@ -4,6 +4,15 @@
 
 > 只托管源码，不做编译/打包。插件通过 `shell` 服务拉起仓库里**已生成**的 runnable workbench（`skill/html-workbench/scripts/workbench.py`，由根目录 `npm run build` 从 `service/` 生成）。
 
+## 面板席位
+
+面板有两个席位，用哪个取决于 profile 里装了什么：
+
+- **装了 `dsh-better-sidebar`**：面板作为它的一个侧栏页面（tab 类型 `html-workbench`）注册，渲染在该插件右侧栏的 tab 体内。DSH 0.1.5-rc.1+ 的右列就是 DSH 原生右侧栏，这一列的宽度、边框和关闭都由它管；此时面板不再自绘浮窗、不再往 `#root` 上写右边距，两者不会争同一块地方。入口在该右侧栏的「新标签页」列表里。
+- **没装 `dsh-better-sidebar`**：面板保持原来的浮窗形态——右上角一个入口按钮，打开后从 `#root` 右侧让出面板宽度，左边缘可拖拽调宽。
+
+席位由 `ctx.inject(['betterSidebar'], …)` 决定：该服务出现时注册侧栏页面并把面板交给它，服务消失时再退回浮窗席位。客户端各 bundle 的装载顺序取决于加载完成时间，侧栏服务常常在这个插件之后才就绪，所以判定的依据只能是服务本身。
+
 ## 目录结构
 
 ```

@@ -91,6 +91,28 @@ return {
 
     const shell = ctx.get('shell')
 
+    // ── Shell API: two shapes, one contract ──────────────────────────────────
+    //
+    // The ShellExecutor that public kernels ship (`@deepseek-ai/dsh-shell`
+    // 0.1.7-rc.2 / 0.2.0-rc.2) exposes `resolve()` + `execute()` only — `run()`
+    // and `start()` were never published, so on a stock installation every call
+    // below threw (`shell.start is not a function`) and the service could never
+    // start. Both shapes are honoured: an executor offering the legacy pair is
+    // driven exactly as before, anything else goes through `execute()` —
+    // `await execute(spec).result()` IS the old `run()` (the foreground
+    // projection whose ShellRunResult/CollectedOutput fields the diagnostics
+    // below already read), and the value `execute()` resolves to IS the old
+    // `start()` handle (ShellExecution extends ShellProcess: status / exitCode /
+    // signal / readOutput() / kill()).
+    const runShell = async (spec) =>
+      typeof shell.run === 'function' ? shell.run(spec) : (await shell.execute(spec)).result()
+    const startShell = async (spec) =>
+      // `onExpiry` only in this branch: `resolve()` defaults to `'kill'` with a
+      // 60s deadline, which would kill the long-running serve process a minute
+      // after start. The legacy branch inherits whatever its executor already
+      // did with a background handle.
+      typeof shell.start === 'function' ? shell.start(spec) : shell.execute({ ...spec, onExpiry: 'none' })
+
     // ── Diagnostics journal ──────────────────────────────────────────────────
     //
     // A failed start used to surface as nothing but a red dot: the only signal
@@ -202,7 +224,7 @@ return {
       if (!IS_WINDOWS || !shell) return null
       const probe = 'py -3 -c ' + quoteArg('import sys; print(sys.executable)')
       try {
-        const result = await shell.run(shell.resolve({ command: probe, timeoutMs: 5000, stdoutMaxBytes: 4096 }))
+        const result = await runShell(shell.resolve({ command: probe, timeoutMs: 5000, stdoutMaxBytes: 4096 }))
         if (!result || result.exitCode !== 0) return { failure: 'py -3: ' + describeRun(result) }
         const executable = outputText(result.stdout).split('\n').pop().trim()
         if (!executable) return { failure: 'py -3: 没有返回解释器路径' }
@@ -224,7 +246,7 @@ return {
         for (const candidate of PYTHON_CANDIDATES) {
           try {
             const spec = shell.resolve({ command: candidate + ' --version', timeoutMs: 5000, stdoutMaxBytes: 4096 })
-            const result = await shell.run(spec)
+            const result = await runShell(spec)
             if (result && result.exitCode === 0) {
               pythonCommand = candidate
               pythonProbeFailedAt = 0
@@ -266,7 +288,7 @@ return {
       const command = python + ' ' + quoteArg(SCRIPT) + ' ' + args
       try {
         const spec = shell.resolve({ command: command, timeoutMs: timeoutMs || 15000, stdoutMaxBytes: 64 * 1024 })
-        const result = await shell.run(spec)
+        const result = await runShell(spec)
         // A non-zero exit is the interesting case and used to be discarded: the
         // CLI prints a structured `{ok:false,error:{code,message}}` on stdout.
         if (!result || result.exitCode !== 0) note('error', 'workbench.py ' + args.split(' ')[0] + ' 执行失败', describeRun(result))
@@ -289,7 +311,7 @@ return {
           timeoutMs: 8000,
           stdoutMaxBytes: 64 * 1024,
         })
-        const result = await shell.run(spec)
+        const result = await runShell(spec)
         if (!result || result.exitCode !== 0) return { ok: false, result: result }
         try {
           const payload = JSON.parse(outputText(result.stdout) || '')
@@ -389,7 +411,7 @@ return {
         + (EDITOR_ROOT ? ' --editor-root ' + quoteArg(EDITOR_ROOT) : '')
       try {
         note('info', '启动本地服务：端口 ' + PORT, command)
-        proc = shell.start(shell.resolve({ command: command, stdoutMaxBytes: 64 * 1024 }))
+        proc = await startShell(shell.resolve({ command: command, stdoutMaxBytes: 64 * 1024 }))
         if (disposed) { try { proc.kill() } catch (e) {} return null }
         ownedProcess = proc
         let transcript = ''
@@ -620,7 +642,7 @@ return {
         stdoutMaxBytes: 1024,
       })
       try {
-        const r = await shell.run(spec)
+        const r = await runShell(spec)
         return { ok: true, isHtml: true, exists: !!(r && r.exitCode === 0), normalized: normalized }
       } catch (e) {
         return { ok: true, isHtml: true, exists: null, normalized: normalized, error: (e && e.message) || String(e) }

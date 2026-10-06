@@ -634,3 +634,88 @@ test('distinct noise cannot evict the startup error either', quiet(async () => {
   const detail = diag.journal.map((entry) => entry.detail || '').join('\n')
   assert.ok(detail.includes("No module named 'ssl'"), 'the startup error must outlive per-keystroke noise')
 }))
+
+// ── Public ShellExecutor API ─────────────────────────────────────────────────
+//
+// The stubs above model the executor this plugin was developed against, which
+// offers `resolve() + run() + start()`. Every kernel PUBLISHED on npm
+// (@deepseek-ai/dsh-shell 0.1.7-rc.2 and 0.2.0-rc.2) offers only
+// `resolve() + execute()` — `run()`/`start()` were never shipped, so on a
+// stock installation the plugin died with `shell.start is not a function`
+// before it could start the service. These stubs model THAT surface, and the
+// assertions below pin the two facts the fallback must not get wrong: the
+// long-running serve process must not inherit resolve()'s 60s kill deadline,
+// and a serve process that dies at once must still surface its output.
+
+/** A shell exposing only the public `resolve() + execute()` surface. */
+const publicShell = ({ serve, foreground } = {}) => ({
+  resolve: (spec) => spec,
+  execute: async (spec) => {
+    if (spec.command.includes(' serve ')) return serve(spec)
+    return {
+      result: async () => (foreground
+        ? foreground(spec)
+        : { exitCode: 1, signal: null, timedOut: false, aborted: false, timeoutMs: 8000, stdout: collected(''), stderr: collected('') }),
+    }
+  },
+})
+
+test('a public kernel (resolve + execute only) starts and supervises the service', async () => {
+  // Like the restart test above: unhealthy at first, so the plugin really goes
+  // through the serve spawn (the reuse branch would never touch it).
+  let serveSpec = null
+  let healthy = false
+  const shell = publicShell({
+    serve: (spec) => {
+      serveSpec = spec
+      healthy = true
+      return { status: 'running', exitCode: null, signal: null, readOutput: () => ({ delta: '', lossy: false }), kill: () => true }
+    },
+    foreground: (spec) => (healthy && spec.command.includes(' health ')
+      ? {
+          exitCode: 0,
+          signal: null,
+          timedOut: false,
+          aborted: false,
+          timeoutMs: 8000,
+          stdout: collected(JSON.stringify({ ok: true, service: 'html-workbench', version: '2.1.0' })),
+          stderr: collected(''),
+        }
+      : { exitCode: 1, signal: null, timedOut: false, aborted: false, timeoutMs: 8000, stdout: collected(''), stderr: collected('') }),
+  })
+  const ctx = await boot(shell, { port: 4930 })
+  const diag = await callRoute(ctx, '/html-workbench/diagnostics')
+
+  assert.equal(diag.running, true)
+  assert.equal(diag.startError, null)
+  assert.ok(diag.journal.some((entry) => entry.message.includes('本地服务就绪')), 'the service must reach the ready state')
+  assert.ok(serveSpec, 'the plugin must actually spawn through execute() on a public kernel')
+  assert.equal(
+    serveSpec.onExpiry,
+    'none',
+    'the long-running service must not inherit resolve()s 60s kill deadline',
+  )
+})
+
+test('a serve process that dies at once is reported on a public kernel, not polled', quiet(async () => {
+  let drained = false
+  const shell = publicShell({
+    serve: () => ({
+      status: 'completed',
+      exitCode: 1,
+      signal: null,
+      readOutput: () => (drained ? { delta: '', lossy: false } : ((drained = true), { delta: '{"ok": false, "error": "PORT_IN_USE"}', lossy: false })),
+      kill: () => true,
+    }),
+  })
+  const started = Date.now()
+  const ctx = await boot(shell, { port: 4931 })
+  const diag = await callRoute(ctx, '/html-workbench/diagnostics')
+
+  assert.equal(diag.running, false)
+  // The CLI's structured error still becomes the headline through the
+  // execute() path, exactly as it did through start().readOutput().
+  assert.match(diag.startError, /端口已被占用/)
+  assert.match(diag.startError, /PORT_IN_USE/)
+  assert.ok(Date.now() - started < 2000, 'a dead process must not look like a hang')
+}))

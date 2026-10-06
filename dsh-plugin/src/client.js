@@ -7,13 +7,10 @@
  * `window.__ModuleLoader__.load(...)` at build time.
  *
  * Responsibilities (runs in the browser):
- *  - Put the panel wherever the profile can carry it. When dsh-better-sidebar
- *    is active the panel becomes one of its tab types and fills that tab's
- *    body inside the column the sidebar owns (DSH's native right Sidebar on
- *    0.1.5-rc.1+); otherwise it is the plugin's own floating panel plus corner
- *    trigger in `shell.overlay`. The sidebar takes over the whole right
- *    column, so contributing a tab is the only way to live there — a second
- *    floating panel would cover it.
+ *  - Register a retained tab in DSH's native right sidebar when available,
+ *    fall back to dsh-better-sidebar's registry on older profiles, then to a
+ *    floating panel plus corner trigger in `shell.overlay`. The sidebar owns
+ *    its column; the workbench must not reserve a second panel's width.
  *  - Layout is browser-like: a two-row chrome at the TOP (identity row +
  *    address/toolbar row) and the preview filling everything below. Nothing
  *    sits at the bottom, so the panel never visually competes with the chat
@@ -271,9 +268,7 @@ header:has([data-slot="conversation.session.header.utilities"]) {
     }
     const writeWidth = (w) => { try { window.localStorage.setItem(WIDTH_KEY, String(w)) } catch (e) {} }
 
-    let resolveTimer = null
-
-    const store = {
+    const createStore = () => ({
       // Which seat the panel is in: the plugin's own floating overlay, or the
       // tab dsh-better-sidebar hosts. Both seats and the stylesheet read this,
       // and `setSeat` is the only writer.
@@ -293,6 +288,8 @@ header:has([data-slot="conversation.session.header.utilities"]) {
       diag: null,
       diagOpen: false,
       restarting: false,
+      resolveTimer: null,
+      resolveSequence: 0,
       listeners: [],
       subscribe(fn) { this.listeners.push(fn); return () => { this.listeners = this.listeners.filter((f) => f !== fn) } },
       set(patch) {
@@ -307,19 +304,25 @@ header:has([data-slot="conversation.session.header.utilities"]) {
         }
         if (dirty) this.listeners.forEach((fn) => { try { fn() } catch (e) {} })
       },
-    }
+    })
 
-    const useStore = () => {
+    // The overlay has one global instance. Sidebar tabs own their editing
+    // state so opening a file in one session cannot remount another's iframe.
+    const store = createStore()
+
+    const useStore = (target = store) => {
       const [, force] = React.useState(0)
-      React.useEffect(() => store.subscribe(() => force((x) => x + 1)), [])
-      return store
+      React.useEffect(() => target.subscribe(() => force((x) => x + 1)), [target])
+      return target
     }
 
     // Only the floating seat reserves width in `#root` and needs the session
     // header to keep clear of its corner trigger, so the sheet swaps with the
     // seat instead of carrying rules the sidebar seat would have to fight.
     let styleEl = null
+    let disposed = false
     const applyStyles = () => {
+      if (disposed) return
       const sheet = store.seat === 'overlay' ? CSS + OVERLAY_CSS : CSS
       if (typeof document === 'undefined') { try { styles.insert(sheet) } catch (e) {} return }
       const stale = document.querySelectorAll('style[' + STYLE_MARK + '], style#html-workbench-dsh-plugin-styles')
@@ -334,6 +337,7 @@ header:has([data-slot="conversation.session.header.utilities"]) {
     }
 
     const setSeat = (next) => {
+      if (disposed) return
       if (store.seat === next) return
       store.set({ seat: next })
       applyStyles()
@@ -342,7 +346,13 @@ header:has([data-slot="conversation.session.header.utilities"]) {
     if (typeof ctx.effect === 'function') {
       ctx.effect(() => {
         applyStyles()
-        return () => { if (styleEl && styleEl.parentNode) styleEl.parentNode.removeChild(styleEl); styleEl = null }
+        return () => {
+          // A nested injection can finish disposing after this effect. Its
+          // fallback must not reinstall styles once the plugin has unloaded.
+          disposed = true
+          if (styleEl && styleEl.parentNode) styleEl.parentNode.removeChild(styleEl)
+          styleEl = null
+        }
       }, 'html-workbench: styles')
     } else {
       applyStyles()
@@ -390,66 +400,66 @@ header:has([data-slot="conversation.session.header.utilities"]) {
         && a.processStatus === b.processStatus && a.exitCode === b.exitCode
     }
 
-    const refresh = (explicit) => {
-      if (explicit) store.set({ refreshing: true })
+    const refresh = (explicit, target = store) => {
+      if (explicit) target.set({ refreshing: true })
       return host.call('list').then((res) => {
         if (res && res.ok) {
           const next = res.assets || []
-          store.set({
-            assets: sameAssets(store.assets, next) ? store.assets : next,
+          target.set({
+            assets: sameAssets(target.assets, next) ? target.assets : next,
             running: !!res.running,
-            diag: sameDiag(store.diag, res) ? store.diag : res,
+            diag: sameDiag(target.diag, res) ? target.diag : res,
           })
         } else {
-          store.set({ error: (res && res.error) || 'list failed' })
+          target.set({ error: (res && res.error) || 'list failed' })
         }
-      }).catch((e) => store.set({ error: String(e && e.message ? e.message : e) }))
-        .then(() => { if (explicit) store.set({ refreshing: false }) })
+      }).catch((e) => target.set({ error: String(e && e.message ? e.message : e) }))
+        .then(() => { if (explicit) target.set({ refreshing: false }) })
     }
 
     // Killing and re-spawning is the one action that fixes most start failures,
     // so it belongs next to the log that reports them.
-    const restartService = () => {
-      store.set({ restarting: true, error: null })
+    const restartService = (target = store) => {
+      target.set({ restarting: true, error: null })
       return host.call('restart').then((res) => {
-        store.set({
+        target.set({
           restarting: false,
           running: !!(res && res.ok),
-          diag: (res && res.diagnostics) || store.diag,
+          diag: (res && res.diagnostics) || target.diag,
           error: res && res.ok ? null : (res && res.error) || '重启失败',
         })
-        if (res && res.ok) refresh()
-      }).catch((e) => store.set({ restarting: false, error: String(e && e.message ? e.message : e) }))
+        if (res && res.ok) refresh(false, target)
+      }).catch((e) => target.set({ restarting: false, error: String(e && e.message ? e.message : e) }))
     }
 
-    const openFile = (path) => {
+    const openFile = (path, target = store) => {
       const file = String(path || '').trim()
       if (!file) return
-      store.set({ loading: true, error: null, pathInput: file })
+      target.set({ loading: true, error: null, pathInput: file })
       host.call('open', { file: file }).then((res) => {
         if (res && res.ok) {
           // Bump the nonce so re-opening the SAME file remounts the iframe:
           // with an unchanged `src` the browser would otherwise keep the old
           // document and "打开" would look like a no-op.
-          store.set({
+          target.set({
             loading: false,
             running: true,
             resolveState: 'exists',
             current: { path: file, url: res.url },
-            nonce: store.nonce + 1,
+            nonce: target.nonce + 1,
           })
         } else {
           // A failed open used to collapse into one opaque line. The host now
           // sends the journal along, so open the log on failure: the cause is
           // one glance away instead of a terminal session away.
-          store.set({
+          target.set({
             loading: false,
             error: (res && res.error) || 'open failed',
-            diag: (res && res.diagnostics) || store.diag,
+            diag: (res && res.diagnostics) || target.diag,
             diagOpen: !!(res && res.diagnostics),
           })
         }
-      }).catch((e) => store.set({ loading: false, error: String(e && e.message ? e.message : e) }))
+      }).catch((e) => target.set({ loading: false, error: String(e && e.message ? e.message : e) }))
     }
 
     const STATE_TITLE = {
@@ -668,24 +678,34 @@ header:has([data-slot="conversation.session.header.utilities"]) {
     window.addEventListener('message', onWorkbenchMessage)
     ctx.effect(() => () => window.removeEventListener('message', onWorkbenchMessage))
 
-    const checkPath = (value) => {
+    const cancelPathCheck = (target) => {
+      if (target.resolveTimer) clearTimeout(target.resolveTimer)
+      target.resolveTimer = null
+      target.resolveSequence += 1
+    }
+
+    const checkPath = (value, target = store) => {
       const trimmed = (value || '').trim()
-      if (resolveTimer) { clearTimeout(resolveTimer); resolveTimer = null }
-      if (!trimmed) { store.set({ resolveState: 'idle' }); return }
-      store.set({ resolveState: 'checking' })
-      resolveTimer = setTimeout(() => {
-        resolveTimer = null
+      cancelPathCheck(target)
+      const sequence = target.resolveSequence
+      if (!trimmed) { target.set({ resolveState: 'idle' }); return }
+      target.set({ resolveState: 'checking' })
+      target.resolveTimer = setTimeout(() => {
+        target.resolveTimer = null
         host.call('resolve', { file: trimmed }).then((res) => {
-          if (!res || res.ok === false) { store.set({ resolveState: 'idle' }); return }
-          if (!res.isHtml) store.set({ resolveState: 'invalid' })
-          else if (res.exists === true) store.set({ resolveState: 'exists' })
-          else if (res.exists === false) store.set({ resolveState: 'missing' })
+          if (sequence !== target.resolveSequence) return
+          if (!res || res.ok === false) { target.set({ resolveState: 'idle' }); return }
+          if (!res.isHtml) target.set({ resolveState: 'invalid' })
+          else if (res.exists === true) target.set({ resolveState: 'exists' })
+          else if (res.exists === false) target.set({ resolveState: 'missing' })
           // `exists: null` means the CHECK could not run (no interpreter, no
           // shell). Staying silent made the field look unresponsive, so promote
           // the host's reason to the banner instead of dropping it.
-          else if (res.error) store.set({ resolveState: 'idle', error: res.error })
-          else store.set({ resolveState: 'idle' })
-        }).catch((e) => store.set({ resolveState: 'idle', error: String(e && e.message ? e.message : e) }))
+          else if (res.error) target.set({ resolveState: 'idle', error: res.error })
+          else target.set({ resolveState: 'idle' })
+        }).catch((e) => {
+          if (sequence === target.resolveSequence) target.set({ resolveState: 'idle', error: String(e && e.message ? e.message : e) })
+        })
       }, 300)
     }
 
@@ -737,8 +757,8 @@ header:has([data-slot="conversation.session.header.utilities"]) {
       } catch (e) { return '' }
     }
 
-    const Diagnostics = () => {
-      const s = useStore()
+    const Diagnostics = ({ panelStore }) => {
+      const s = useStore(panelStore)
       const d = s.diag
       const journal = (d && d.journal) || []
       const [copied, setCopied] = React.useState(false)
@@ -783,9 +803,9 @@ header:has([data-slot="conversation.session.header.utilities"]) {
         const text = lines.join('\n')
         const done = () => { setCopied(true); setTimeout(() => setCopied(false), 1600) }
         if (navigator.clipboard && navigator.clipboard.writeText) {
-          navigator.clipboard.writeText(text).then(done, () => store.set({ error: '复制失败，请手动访问 /html-workbench/diagnostics 获取原始信息。' }))
+          navigator.clipboard.writeText(text).then(done, () => panelStore.set({ error: '复制失败，请手动访问 /html-workbench/diagnostics 获取原始信息。' }))
         } else {
-          store.set({ error: '当前环境不支持剪贴板，请访问 /html-workbench/diagnostics 获取原始信息。' })
+          panelStore.set({ error: '当前环境不支持剪贴板，请访问 /html-workbench/diagnostics 获取原始信息。' })
         }
       }
 
@@ -799,11 +819,11 @@ header:has([data-slot="conversation.session.header.utilities"]) {
           }, copied ? '已复制' : '复制报告'),
           React.createElement('button', {
             type: 'button', className: 'hwb-btn hwb-btn-quiet hwb-btn-sm',
-            disabled: s.restarting, onClick: restartService,
+            disabled: s.restarting, onClick: () => restartService(panelStore),
           }, s.restarting ? '重启中…' : '重启服务'),
           React.createElement('button', {
             type: 'button', className: 'hwb-icon', title: '收起诊断', 'aria-label': '收起诊断',
-            onClick: () => store.set({ diagOpen: false }),
+            onClick: () => panelStore.set({ diagOpen: false }),
           }, I_CLOSE),
         ),
         d
@@ -886,12 +906,15 @@ header:has([data-slot="conversation.session.header.utilities"]) {
     // nothing. Only the floating seat carries the resize handle and the close
     // button — the sidebar owns that tab's width and its closing.
     const Panel = ({ placement, visible }) => {
-      const s = useStore()
       const overlay = placement === 'overlay'
+      const layout = useStore()
+      const [localStore] = React.useState(createStore)
+      const store = overlay ? layout : localStore
+      const s = useStore(store)
       // The floating seat draws only while it is the live one and open; the
       // sidebar's body exists exactly as long as its tab does, so it always
       // draws and only pauses what it polls.
-      const live = overlay ? s.seat === 'overlay' && s.open : true
+      const live = overlay ? layout.seat === 'overlay' && layout.open : true
       const [menuOpen, setMenuOpen] = React.useState(false)
       const [focused, setFocused] = React.useState(false)
       const fieldRef = React.useRef(null)
@@ -910,13 +933,13 @@ header:has([data-slot="conversation.session.header.utilities"]) {
       const polling = overlay ? live : visible !== false
       React.useEffect(() => {
         if (!polling) return undefined
-        refresh()
-        const dispose = ctx.interval(refresh, 4000)
+        refresh(false, store)
+        const dispose = ctx.interval(() => refresh(false, store), 4000)
         return () => { if (dispose) dispose() }
-      }, [polling])
+      }, [polling, store])
 
       // Drop any in-flight path check when the panel closes.
-      React.useEffect(() => () => { if (resolveTimer) { clearTimeout(resolveTimer); resolveTimer = null } }, [])
+      React.useEffect(() => () => cancelPathCheck(store), [store])
 
       React.useEffect(() => {
         if (!menuOpen) return undefined
@@ -932,8 +955,8 @@ header:has([data-slot="conversation.session.header.utilities"]) {
       const assets = s.assets || []
       const trimmed = (s.pathInput || '').trim()
       const currentPath = s.current ? s.current.path : null
-      const submit = () => { if (trimmed) { setMenuOpen(false); openFile(trimmed) } }
-      const pick = (p) => { setMenuOpen(false); store.set({ pathInput: p }); openFile(p) }
+      const submit = () => { if (trimmed) { setMenuOpen(false); openFile(trimmed, store) } }
+      const pick = (p) => { setMenuOpen(false); store.set({ pathInput: p }); openFile(p, store) }
 
       const assetRow = (a, inMenu) => React.createElement('button', {
         key: a.id || a.path,
@@ -977,7 +1000,7 @@ header:has([data-slot="conversation.session.header.utilities"]) {
               React.createElement('div', { style: { display: 'flex', gap: '8px' } },
                 React.createElement('button', {
                   type: 'button', className: 'hwb-btn hwb-btn-primary hwb-btn-sm',
-                  disabled: s.restarting, onClick: restartService,
+                  disabled: s.restarting, onClick: () => restartService(store),
                 }, s.restarting ? '重启中…' : '重启服务'),
                 React.createElement('button', {
                   type: 'button', className: 'hwb-btn hwb-btn-quiet hwb-btn-sm',
@@ -1055,7 +1078,7 @@ header:has([data-slot="conversation.session.header.utilities"]) {
               React.createElement('button', {
                 type: 'button', className: 'hwb-icon', title: '刷新产物列表',
                 'aria-label': '刷新产物列表', 'data-spin': s.refreshing ? '' : undefined,
-                onClick: () => refresh(true),
+                onClick: () => refresh(true, store),
               }, I_REFRESH),
               React.createElement('button', {
                 type: 'button', className: 'hwb-icon', title: '在浏览器标签页中打开',
@@ -1084,7 +1107,7 @@ header:has([data-slot="conversation.session.header.utilities"]) {
                   spellCheck: false,
                   autoComplete: 'off',
                   'aria-label': 'HTML 文件绝对路径',
-                  onChange: (e) => { const v = e.target.value; store.set({ pathInput: v }); checkPath(v) },
+                  onChange: (e) => { const v = e.target.value; store.set({ pathInput: v }); checkPath(v, store) },
                   onKeyDown: (e) => {
                     if (e.key === 'Enter') submit()
                     else if (e.key === 'ArrowDown' && assets.length) { e.preventDefault(); setMenuOpen(true) }
@@ -1142,7 +1165,7 @@ header:has([data-slot="conversation.session.header.utilities"]) {
           )
           : null,
 
-        s.diagOpen ? React.createElement(Diagnostics) : null,
+        s.diagOpen ? React.createElement(Diagnostics, { panelStore: store }) : null,
 
         React.createElement('div', { className: 'hwb-body' }, body),
       )
@@ -1161,34 +1184,82 @@ header:has([data-slot="conversation.session.header.utilities"]) {
       }, I_TRIGGER)
     }
 
-    // ── Seat registration ────────────────────────────────────────────────────
-    //
-    // dsh-better-sidebar turns the right column into DSH's native Sidebar and
-    // renders every registered tab type there, so contributing one is the way a
-    // plugin lives on that column. While that tab is up the panel draws nothing
-    // of its own — no floating seat, no corner trigger, no clearance in `#root`
-    // — because the sidebar owns the column's width and its chrome.
-    //
-    // Which seat is live cannot be settled while this half applies: client
-    // bundles activate in the order their loads finish, so the sidebar's service
-    // often arrives afterwards. `ctx.inject` waits for it, and its fiber is
-    // unloaded if the service ever goes away, which hands the panel back to the
-    // floating seat — both seats stay registered and the store decides.
-    ctx.inject(['betterSidebar'], (sidebarCtx) => {
-      sidebarCtx.effect(() => sidebarCtx.betterSidebar.registerTab({
-        id: 'html-workbench',
-        title: 'HTML Workbench',
-        description: '可视化预览与编辑 agent 生成的 HTML',
-        icon: triggerGlyph,
-        order: 60,
-        single: true,
-        component: (props) => React.createElement(Panel, {
+    // Prefer the native registry: DSH 0.2 needs keepMounted to preserve an
+    // iframe through tab/session changes. better-sidebar 0.24.1 does not yet
+    // forward that option. Its registry remains a fallback for older profiles.
+    const tabId = '@vibe-x/dsh-html-workbench'
+    let nativeReady = false
+    let legacyContext = null
+    let disposeLegacy = null
+    const syncSidebar = () => {
+      if (disposed) return
+      if (nativeReady && disposeLegacy) {
+        disposeLegacy()
+        disposeLegacy = null
+      }
+      if (!nativeReady && legacyContext && !disposeLegacy) {
+        disposeLegacy = legacyContext.effect(() => legacyContext.betterSidebar.registerTab({
+          id: 'html-workbench',
+          title: 'HTML Workbench',
+          description: '可视化预览与编辑 agent 生成的 HTML',
+          icon: triggerGlyph,
+          order: 60,
+          single: true,
+          component: (props) => React.createElement(Panel, {
+            key: JSON.stringify([props.scope && props.scope.sessionId, props.tab && props.tab.id]),
+            placement: 'sidebar',
+            visible: props.visible,
+          }),
+        }), 'html-workbench: legacy sidebar tab')
+      }
+      setSeat(nativeReady || disposeLegacy ? 'sidebar' : 'overlay')
+    }
+
+    ctx.inject(['sidebarRightTabs'], (nativeCtx) => {
+      if (!slots) return
+      // Release the legacy kind before registering the native implementation.
+      nativeReady = true
+      syncSidebar()
+      nativeCtx.effect(() => () => {
+        nativeReady = false
+        syncSidebar()
+      }, 'html-workbench: native fallback')
+      nativeCtx.effect(() => slots.inject('sidebar.right.pane.tab', () => slots.register({
+        name: 'sidebar.right.pane.tab',
+        key: tabId,
+        inject: (sessionId) => ({ sessionId }),
+      }, (props) => {
+        const tab = props.useTabInfo ? props.useTabInfo().tab : (props.tab || {})
+        return React.createElement(Panel, {
+          key: JSON.stringify([props.sessionId, tab.id]),
           placement: 'sidebar',
-          visible: props.visible,
-        }),
-      }), 'html-workbench: sidebar tab')
-      setSeat('sidebar')
-      sidebarCtx.effect(() => () => setSeat('overlay'), 'html-workbench: floating seat')
+          visible: tab.visible,
+        })
+      })), 'html-workbench: native tab body')
+      nativeCtx.effect(() => nativeCtx.sidebarRightTabs.register({
+        id: tabId,
+        kind: 'html-workbench',
+        keepMounted: true,
+        title: () => 'HTML Workbench',
+        guide: [{
+          id: 'html-workbench',
+          order: 60,
+          title: () => 'HTML Workbench',
+          description: () => '可视化预览与编辑 agent 生成的 HTML',
+          icon: (props) => triggerGlyph(props.size || 16),
+        }],
+      }), 'html-workbench: native tab type')
+    })
+
+    ctx.inject(['betterSidebar'], (sidebarCtx) => {
+      legacyContext = sidebarCtx
+      syncSidebar()
+      sidebarCtx.effect(() => () => {
+        legacyContext = null
+        if (disposeLegacy) disposeLegacy()
+        disposeLegacy = null
+        syncSidebar()
+      }, 'html-workbench: legacy fallback')
     })
 
     if (slots === undefined) return

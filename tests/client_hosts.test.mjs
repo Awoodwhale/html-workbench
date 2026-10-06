@@ -1,8 +1,8 @@
 /**
  * Seating contracts for the DSH plugin's client half.
  *
- * The panel has two seats: a tab of dsh-better-sidebar when that plugin is
- * installed, and the plugin's own floating overlay otherwise. Exactly one is
+ * The panel has two seats: a native or legacy sidebar tab when available,
+ * and the plugin's own floating overlay otherwise. Exactly one is
  * live, and the geometry that belongs to the floating seat — the width it takes
  * out of `#root`, the corner trigger's room in the session header — must never
  * reach the document while the sidebar hosts the panel, because that column's
@@ -27,7 +27,7 @@ const CLIENT_BODY = readFileSync(resolve(HERE, '..', 'dsh-plugin', 'src', 'clien
 /** Just enough React for a body whose components are CALLED, never mounted. */
 const React = {
   createElement: (type, props, ...children) => ({ type, props: props || {}, children }),
-  useState: (initial) => [initial, () => {}],
+  useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
   useEffect: () => {},
   useRef: (initial) => ({ current: initial }),
 }
@@ -93,9 +93,10 @@ const makeContext = (slots) => {
   const context = {
     slots,
     injection: null,
+    injections: new Map(),
     get: (name) => (name === 'slots' ? slots : undefined),
     effect: (fn) => { fn(); return () => {} },
-    inject: (deps, callback) => { context.injection = { deps, callback }; return {} },
+    inject: (deps, callback) => { context.injection = { deps, callback }; context.injections.set(deps[0], callback); return {} },
     interval: () => () => {},
   }
   return context
@@ -155,11 +156,11 @@ test('the body only needs the slot registry to load', () => {
   assert.equal(typeof app.plugin.apply, 'function')
 })
 
-test('without dsh-better-sidebar the panel keeps the floating seat', () => {
+test('without a sidebar service the panel keeps the floating seat', () => {
   const app = mount()
 
   assert.deepEqual(app.slots.entries.map((entry) => entry.key), ['shell.overlay', 'shell.overlay'])
-  assert.deepEqual(app.context.injection.deps, ['betterSidebar'])
+  assert.deepEqual([...app.context.injections.keys()], ['sidebarRightTabs', 'betterSidebar'])
 
   const sheet = app.sheet()
   assert.match(sheet, /html #root\s*\{[^}]*margin-right/)
